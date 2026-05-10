@@ -228,7 +228,7 @@ func runBot(ctx context.Context, fc *FileConfig, bc BotConfig, mgr *AgentRuntime
 		Env:            bc.Claude.Env,
 	})
 	if mgr != nil {
-		mgr.trackBridge(br)
+		mgr.trackBridge(bc.ID, br)
 	}
 	br.Start()
 

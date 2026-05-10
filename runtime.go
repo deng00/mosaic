@@ -43,6 +43,7 @@ type AgentRuntime struct {
 type runningAgent struct {
 	bc     BotConfig
 	cancel context.CancelFunc
+	bridge *agent.Bridge // set by trackBridgeForAgent once the bridge is built
 }
 
 func NewAgentRuntime(ctx context.Context, fc *FileConfig, path string, wg *sync.WaitGroup) *AgentRuntime {
@@ -237,13 +238,29 @@ func writeConfig(path string, fc *FileConfig) error {
 
 // trackBridge records a Bridge so /project mutations can fan out
 // resolution-cache invalidations to every running agent's bridge.
-func (r *AgentRuntime) trackBridge(b *agent.Bridge) {
+// agentID identifies which configured agent the bridge belongs to so
+// the dispatcher can look it up by ID later.
+func (r *AgentRuntime) trackBridge(agentID string, b *agent.Bridge) {
 	r.mu.Lock()
 	r.bridges = append(r.bridges, b)
+	if ra, ok := r.running[agentID]; ok {
+		ra.bridge = b
+	}
 	// Make sure the new bridge starts with the live members list.
 	members := append([]string(nil), r.cfg.Members...)
 	r.mu.Unlock()
 	b.UpdateMembers(members)
+}
+
+// BridgeForAgent returns the live Bridge for a given configured agent
+// id (e.g. "cindy"). nil when the agent is offline / not yet started.
+func (r *AgentRuntime) BridgeForAgent(agentID string) *agent.Bridge {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if ra, ok := r.running[agentID]; ok {
+		return ra.bridge
+	}
+	return nil
 }
 
 // Members implements agent.AgentManager.Members.

@@ -39,10 +39,14 @@ type ProjectConfig struct {
 }
 
 // RoomConfig overrides project / fallback values for a single room.
-// Both fields are optional; empty means "fall through".
+// All fields are optional; empty means "fall through".
 type RoomConfig struct {
 	Cwd   string
 	Model string
+	// Env is extra KEY=VALUE pairs merged into the per-spawn env for
+	// THIS room only. Used by the dispatcher to inject task-scoped
+	// callback credentials (MOSAIC_TASK_ID, MOSAIC_TOKEN, etc.).
+	Env map[string]string
 }
 
 // resolution is the per-room derived settings: which project the room
@@ -53,6 +57,7 @@ type resolution struct {
 	ProjectName string
 	Cwd         string
 	Model       string
+	Env         map[string]string // per-room env merged on top of Options.Env
 }
 
 // Options configures the Bridge. Cwd defaults to the process cwd if
@@ -158,6 +163,71 @@ func (b *Bridge) UpdateMembers(members []string) {
 	b.mu.Unlock()
 }
 
+// RegisterRoomOverride installs (or replaces) a per-room cwd / model /
+// env override. Used by the dispatcher to attach a workspace path +
+// task-callback env to a freshly created topic-room before spawning
+// claude in it. Drops any cached resolution so the next spawn picks up
+// the new values.
+func (b *Bridge) RegisterRoomOverride(roomID id.RoomID, rc RoomConfig) {
+	b.mu.Lock()
+	if b.opts.Rooms == nil {
+		b.opts.Rooms = map[string]RoomConfig{}
+	}
+	b.opts.Rooms[string(roomID)] = rc
+	delete(b.resolutions, roomID)
+	b.mu.Unlock()
+}
+
+// MatrixUserID exposes the agent's own Matrix user id for callers
+// (e.g. dispatcher needs it to know who created a room).
+func (b *Bridge) MatrixUserID() id.UserID {
+	return b.mx.UserID()
+}
+
+// CreateTaskRoom asks the underlying matrix client to create a topic-
+// room owned by this agent, attached to parentSpace, with the given
+// invitees. Convenience wrapper so the dispatcher doesn't need its
+// own *matrix.Client handle.
+func (b *Bridge) CreateTaskRoom(ctx context.Context, name, topic string, parentSpace id.RoomID, invite []id.UserID) (id.RoomID, error) {
+	return b.mx.CreateRoom(ctx, matrix.CreateRoomOpts{
+		Name:        name,
+		Topic:       topic,
+		ParentSpace: parentSpace,
+		Invite:      invite,
+		Preset:      "private_chat",
+	})
+}
+
+// RunTaskTurn kicks off a fresh claude turn in roomID. Skips the usual
+// ACL / sender-filter path because the dispatcher (not a human user)
+// is the trigger. The room must already have its per-room override
+// registered via RegisterRoomOverride so the spawn picks up the
+// workspace cwd + task env.
+//
+// kickoff is the visible chat message that triggers the turn; agents
+// see it as a regular user message. Keep it short — the heavy lifting
+// belongs in the system-prompt layer (Memory / TASK.md).
+func (b *Bridge) RunTaskTurn(roomID id.RoomID, kickoff string) error {
+	ctx := context.Background()
+	// Render the kickoff visibly into the room first so users in
+	// Element see what was sent to the agent. Best-effort.
+	if _, err := b.mx.SendText(ctx, roomID, kickoff); err != nil {
+		log.Printf("[agent] task kickoff send failed: %v", err)
+	}
+	sess := b.getOrCreate(ctx, roomID)
+	if sess == nil || sess.inbox == nil {
+		return fmt.Errorf("agent: failed to spawn claude for task room %s", roomID)
+	}
+	// Push directly into the inbox — handleMessage filters out the
+	// bridge's own UID, which would make a self-sent kickoff a no-op.
+	select {
+	case sess.inbox <- turnRequest{sender: b.mx.UserID(), text: kickoff}:
+		return nil
+	default:
+		return fmt.Errorf("agent: task room %s inbox full", roomID)
+	}
+}
+
 // expandHome expands a leading ~ to $HOME. Go's exec/chdir don't do
 // this (the shell does), so user-typed config paths like
 // `~/Code/foo` literally try to chdir into a directory named "~",
@@ -212,13 +282,20 @@ func (b *Bridge) resolve(ctx context.Context, roomID id.RoomID) resolution {
 
 	// Per-room override wins over both. Useful for one-off rooms
 	// that should aim a sandboxed cwd while still being visually
-	// inside a regular Space.
+	// inside a regular Space, and for the dispatcher's per-task
+	// rooms (workspace cwd + task callback env).
 	if rc, ok := b.opts.Rooms[string(roomID)]; ok {
 		if rc.Cwd != "" {
 			r.Cwd = rc.Cwd
 		}
 		if rc.Model != "" {
 			r.Model = rc.Model
+		}
+		if len(rc.Env) > 0 {
+			r.Env = make(map[string]string, len(rc.Env))
+			for k, v := range rc.Env {
+				r.Env[k] = v
+			}
 		}
 	}
 
@@ -315,7 +392,7 @@ func (b *Bridge) handleMessage(ctx context.Context, roomID id.RoomID, eventID id
 		log.Printf("[agent] no session inbox for %s — claude spawn failed; replying error to user", roomID)
 		_, _ = b.mx.SendText(context.Background(), roomID,
 			"❌ 起 claude 子进程失败 —— 多半是配置的 cwd 在这台机器上不存在。"+
-				"用 `!project status` 看当前解析的 cwd，再 `!project set-cwd <有效路径>` 改正。"+
+				"用 `!project status` 看当前解析的 cwd，再 `!project cwd <有效路径>` 改正。"+
 				"详细错见 `~/.mosaic/agent.log`.")
 		return
 	}
@@ -341,7 +418,7 @@ func isReadOnlySlash(text string) bool {
 	switch cmd {
 	case "/help", "/status", "/agent", "/project":
 		// /agent and /project sub-dispatch their own ACL — list/help
-		// is fine; mutating subs (new / set-cwd / allow) re-check.
+		// is fine; mutating subs (new / cwd / allow) re-check.
 		return true
 	}
 	return false
@@ -597,7 +674,7 @@ func (b *Bridge) isAllowed(sender id.UserID) bool {
 
 // handleProjectSlash dispatches /project <subcmd>. Read-only sub-
 // commands (status / list / help) anyone can run; mutating ones
-// (set-cwd / name) are gated by the Admins list.
+// (cwd / name) are gated by the Admins list.
 func (b *Bridge) handleProjectSlash(ctx context.Context, roomID id.RoomID, sender id.UserID, args string) bool {
 	subcmd := args
 	rest := ""
@@ -658,7 +735,7 @@ func (b *Bridge) handleProjectSlash(ctx context.Context, roomID id.RoomID, sende
 		sb.WriteString("**当前 Space 的 project**\n\n")
 		fmt.Fprintf(&sb, "- space: `%s`\n", FoldHomeServer(string(r.SpaceID), b.opts.ServerName))
 		if found == nil {
-			sb.WriteString("- 还没配置——发 `/project name <名字>` 或 `/project set-cwd <path>` 即可初始化\n")
+			sb.WriteString("- 还没配置——发 `/project name <名字>` 或 `/project cwd <path>` 即可初始化\n")
 		} else {
 			fmt.Fprintf(&sb, "- name: %s\n", or(found.Name, "_(none)_"))
 			fmt.Fprintf(&sb, "- cwd: `%s`\n", or(found.Cwd, "_(default)_"))
@@ -695,13 +772,13 @@ func (b *Bridge) handleProjectSlash(ctx context.Context, roomID id.RoomID, sende
 		_, _ = b.mx.SendText(ctx, roomID, sb.String())
 		return true
 
-	case "set-cwd":
+	case "cwd":
 		if !b.isAdmin(sender) {
-			_, _ = b.mx.SendText(ctx, roomID, "⛔ `/project set-cwd` 需要管理员权限")
+			_, _ = b.mx.SendText(ctx, roomID, "⛔ `/project cwd` 需要管理员权限")
 			return true
 		}
 		if rest == "" {
-			_, _ = b.mx.SendText(ctx, roomID, "用法：`/project set-cwd /path/to/project`")
+			_, _ = b.mx.SendText(ctx, roomID, "用法：`/project cwd /path/to/project`")
 			return true
 		}
 		return b.applyProjectMutation(ctx, roomID, "", rest, "")
@@ -734,7 +811,7 @@ func (b *Bridge) applyProjectMutation(ctx context.Context, roomID id.RoomID, nam
 	parents, err := b.mx.ParentSpaces(ctx, roomID)
 	if err != nil || len(parents) == 0 {
 		_, _ = b.mx.SendText(ctx, roomID,
-			"⚠️ 当前 room 不在任何 Space 下。先在 Element 里把它加进一个 Space，然后再 `/project set-cwd ...`。")
+			"⚠️ 当前 room 不在任何 Space 下。先在 Element 里把它加进一个 Space，然后再 `/project cwd ...`。")
 		return true
 	}
 	spaceID := string(parents[0])
@@ -762,7 +839,7 @@ const projectSlashHelp = `**` + "`/project`" + ` 命令家族**
 
 - ` + "`/project status`" + ` — 显示当前 room 的 Space / project / cwd 解析结果
 - ` + "`/project list`" + ` — 列出所有已配置 project
-- ` + "`/project set-cwd <path>`" + ` — 给当前 room 所属 Space 设工作目录 ⛔ admin only
+- ` + "`/project cwd <path>`" + ` — 给当前 room 所属 Space 设工作目录 ⛔ admin only
 - ` + "`/project name <name>`" + ` — 给当前 Space 起个人类可读的名字 ⛔ admin only
 - ` + "`/project help`" + ` — 这条帮助
 
@@ -851,7 +928,7 @@ const slashHelp = `**可用命令**
 - ` + "`/unarchive`" + ` — 唤醒已归档的 room
 - ` + "`/status`" + ` — 显示当前 room 的 session id / project / cwd
 - ` + "`/agent`" + ` — agent 管理（list / new …）— 见 ` + "`/agent help`" + `
-- ` + "`/project`" + ` — project 管理（status / set-cwd / name …）— 见 ` + "`/project help`" + `
+- ` + "`/project`" + ` — project 管理（status / cwd / name …）— 见 ` + "`/project help`" + `
 - ` + "`/help`" + ` — 这条帮助
 
 > Element web 对 ` + "`/`" + ` 起头的未知命令会弹 "Unknown Command" 提示——回车或点 Send as message 即可发出。
@@ -1322,14 +1399,15 @@ func (b *Bridge) getOrCreate(ctx context.Context, roomID id.RoomID) *roomSession
 		// re-injecting an outdated SUMMARY.md would confuse it.
 		appendSP = b.opts.Memory.SystemPrompt(r.SpaceID, roomID)
 	}
-	log.Printf("[agent] spawning claude (cwd=%s model=%q resume=%q sysPromptLen=%d)", cwd, model, resume, len(appendSP))
+	mergedEnv := mergeEnv(b.opts.Env, r.Env)
+	log.Printf("[agent] spawning claude (cwd=%s model=%q resume=%q sysPromptLen=%d envKeys=%d)", cwd, model, resume, len(appendSP), len(mergedEnv))
 	proc, err := streamjson.Spawn(procCtx, streamjson.Options{
 		Cwd:                cwd,
 		Model:              model,
 		PermissionMode:     b.opts.PermissionMode,
 		Binary:             b.opts.Binary,
 		Resume:             resume,
-		ExtraEnv:           envMapToSlice(b.opts.Env),
+		ExtraEnv:           envMapToSlice(mergedEnv),
 		AppendSystemPrompt: appendSP,
 	})
 	if err != nil {
@@ -1430,6 +1508,22 @@ func envMapToSlice(m map[string]string) []string {
 	out := make([]string, 0, len(m))
 	for k, v := range m {
 		out = append(out, k+"="+v)
+	}
+	return out
+}
+
+// mergeEnv returns base ⊕ overlay (overlay wins). Either side may be
+// nil; result is nil only when both are.
+func mergeEnv(base, overlay map[string]string) map[string]string {
+	if len(base) == 0 && len(overlay) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(base)+len(overlay))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range overlay {
+		out[k] = v
 	}
 	return out
 }

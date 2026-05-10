@@ -255,6 +255,62 @@ func (c *Client) DeleteUserRoomTag(ctx context.Context, roomID id.RoomID, tag st
 	return err
 }
 
+// CreateRoomOpts configures a per-task topic-room creation.
+type CreateRoomOpts struct {
+	Name        string      // visible name in Element
+	Topic       string      // visible topic / description
+	ParentSpace id.RoomID   // optional Space to attach as a child
+	Invite      []id.UserID // users to invite
+	Preset      string      // e.g. "private_chat" or "trusted_private_chat" (default: "private_chat")
+}
+
+// CreateRoom creates a new Matrix room owned by this client. When
+// ParentSpace is set, also publishes the m.space.child + m.space.parent
+// state events so it shows up in Element under the Space tree. Returns
+// the new room id.
+func (c *Client) CreateRoom(ctx context.Context, opts CreateRoomOpts) (id.RoomID, error) {
+	preset := opts.Preset
+	if preset == "" {
+		preset = "private_chat"
+	}
+	req := &mautrix.ReqCreateRoom{
+		Name:     opts.Name,
+		Topic:    opts.Topic,
+		Invite:   opts.Invite,
+		Preset:   preset,
+		IsDirect: false,
+	}
+	resp, err := c.mx.CreateRoom(ctx, req)
+	if err != nil {
+		return "", fmt.Errorf("matrix: create room: %w", err)
+	}
+	roomID := resp.RoomID
+	if opts.ParentSpace != "" {
+		// Best-effort wire into the Space. Failures here don't void
+		// the room; log and continue (the room is still usable).
+		via := serverPart(string(c.mx.UserID))
+		if _, err := c.mx.SendStateEvent(ctx, opts.ParentSpace, event.StateSpaceChild, string(roomID),
+			&event.SpaceChildEventContent{Via: []string{via}}); err != nil {
+			log.Printf("[matrix] m.space.child failed (room created OK): %v", err)
+		}
+		if _, err := c.mx.SendStateEvent(ctx, roomID, event.StateSpaceParent, string(opts.ParentSpace),
+			&event.SpaceParentEventContent{Via: []string{via}, Canonical: true}); err != nil {
+			log.Printf("[matrix] m.space.parent failed (room created OK): %v", err)
+		}
+	}
+	return roomID, nil
+}
+
+// serverPart returns the homeserver portion of "@user:server" or
+// "!room:server". Used to compute the "via" hint for space child/parent
+// state events.
+func serverPart(matrixID string) string {
+	if i := strings.IndexByte(matrixID, ':'); i >= 0 {
+		return matrixID[i+1:]
+	}
+	return ""
+}
+
 // ParentSpaces returns the Matrix Space room IDs this room is a child
 // of, by reading the room's m.space.parent state events. Returns an
 // empty slice when the room is not in any space, or on error reading
