@@ -211,6 +211,26 @@ func (c *Client) OnMessage(h MessageHandler) {
 // UserID returns the bot's full Matrix ID (@bot:domain).
 func (c *Client) UserID() id.UserID { return c.mx.UserID }
 
+// SetDisplayName updates the bot's user-profile display name (shows
+// in member lists and as the sender label on messages). Empty string
+// clears it. Push via Matrix profile API; sticks across restarts.
+func (c *Client) SetDisplayName(ctx context.Context, name string) error {
+	return c.mx.SetDisplayName(ctx, name)
+}
+
+// SetDeviceName updates this device's display label (what shows up
+// in the user's "active sessions" page). cryptohelper persists the
+// device across restarts but doesn't re-push the display name on
+// subsequent inits, so we PUT it explicitly each startup.
+func (c *Client) SetDeviceName(ctx context.Context, name string) error {
+	if c.mx.DeviceID == "" {
+		return nil
+	}
+	url := c.mx.BuildClientURL("v3", "devices", c.mx.DeviceID)
+	_, err := c.mx.MakeRequest(ctx, "PUT", url, &mautrix.ReqPutDevice{DisplayName: name}, nil)
+	return err
+}
+
 // SetUserRoomTag adds a per-user m.tag account-data entry on the
 // room. Element treats `m.lowpriority` and `m.favourite` natively;
 // custom tags (`u.archived`, etc.) appear under "Other". Removing a

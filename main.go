@@ -108,7 +108,14 @@ func runBot(ctx context.Context, fc *FileConfig, bc BotConfig, mgr *AgentRuntime
 
 	deviceName := bc.DeviceName
 	if deviceName == "" {
-		deviceName = "mosaic (" + bc.ID + ")"
+		// Default device name to the host this mosaic process runs on
+		// — that's what the field actually represents (which machine
+		// the agent's claude subprocess executes on).
+		if h, err := os.Hostname(); err == nil && h != "" {
+			deviceName = h
+		} else {
+			deviceName = bc.ID
+		}
 	}
 
 	mx, err := matrix.Login(ctx, matrix.Config{
@@ -125,6 +132,21 @@ func runBot(ctx context.Context, fc *FileConfig, bc BotConfig, mgr *AgentRuntime
 		return
 	}
 	log.Printf("[%s] logged in as %s", bc.ID, mx.UserID())
+	if bc.DisplayName != "" {
+		if err := mx.SetDisplayName(ctx, bc.DisplayName); err != nil {
+			log.Printf("[%s] set display name failed: %v", bc.ID, err)
+		} else {
+			log.Printf("[%s] display name → %q", bc.ID, bc.DisplayName)
+		}
+	}
+	// Push device name every startup — the cryptohelper reuses the
+	// same device across restarts so we must PUT to refresh, not rely
+	// on InitialDeviceDisplayName (only honored at first login).
+	if err := mx.SetDeviceName(ctx, deviceName); err != nil {
+		log.Printf("[%s] set device name failed: %v", bc.ID, err)
+	} else {
+		log.Printf("[%s] device name → %q", bc.ID, deviceName)
+	}
 
 	store, err := agent.NewSessionStore(filepath.Join(dataDir, "sessions.json"))
 	if err != nil {

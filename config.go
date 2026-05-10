@@ -88,11 +88,22 @@ func (c *FileConfig) AllAgents() []BotConfig {
 }
 
 type BotConfig struct {
-	ID         string       `yaml:"id"`          // unique per-deployment, used as data subdir name
-	User       string       `yaml:"user"`        // localpart
-	Password   string       `yaml:"password"`
-	DeviceName string       `yaml:"device_name"`
-	Claude     ClaudeConfig `yaml:"claude"`
+	ID       string `yaml:"id"`       // unique per-deployment, used as data subdir name
+	User     string `yaml:"user"`     // localpart (immutable; the Matrix account user_id)
+	Password string `yaml:"password"`
+	// DeviceName tells *which machine* this agent's claude subprocess
+	// runs on. Visible in the user's "active sessions" page in Element
+	// (think "Cindy on danny's MacBook" vs "Cindy on the office Mac
+	// mini"). Defaults to os.Hostname() when empty — useful when the
+	// same agent identity has multiple `mosaic` instances live across
+	// machines.
+	DeviceName string `yaml:"device_name,omitempty"`
+	// DisplayName is the agent's user-visible profile name (what other
+	// room members see in the member list and as message sender).
+	// Pushed to Matrix profile on every startup. Empty keeps whatever
+	// Matrix has stored.
+	DisplayName string       `yaml:"display_name,omitempty"`
+	Claude      ClaudeConfig `yaml:"claude"`
 
 	// AutoJoinSpaceChildren: when true and the bot is a member of any
 	// Space, every newly added m.space.child triggers a JoinRoomByID
