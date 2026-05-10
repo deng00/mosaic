@@ -1,29 +1,25 @@
-# Pure-Go olm/megolm via build tag — no cgo, no libolm system dep.
+# Pure-Go olm/megolm via build tag — no cgo for olm, no libolm system dep.
+# (cgo is still on for sqlite via mattn/go-sqlite3)
 GO_TAGS := goolm
-BIN := mosaic
 
-.PHONY: build run clean tidy testmsg readroom all
+.PHONY: install build clean tidy testmsg readroom
 
-all: build testmsg readroom
+# Default: install to $GOBIN (or $GOPATH/bin) — keeps source tree clean.
+install:
+	go install -tags $(GO_TAGS) .
 
-# cgo is still required by mattn/go-sqlite3 (mautrix's crypto store backend),
-# but we no longer link against libolm — goolm provides olm/megolm in pure Go.
+# Build into the source tree (only for one-off testing / debugging).
 build:
-	go build -tags $(GO_TAGS) -o $(BIN) .
+	go build -tags $(GO_TAGS) -o mosaic .
 
 testmsg:
-	go build -tags $(GO_TAGS) -o testmsg ./cmd/testmsg
+	go install -tags $(GO_TAGS) ./cmd/testmsg
 
 readroom:
-	go build -tags $(GO_TAGS) -o readroom ./cmd/readroom
-
-run: build
-	@if [ ! -f .env ]; then echo "make a .env first (copy config.example.env)"; exit 1; fi
-	set -a; . ./.env; set +a; ./$(BIN)
+	go install -tags $(GO_TAGS) ./cmd/readroom
 
 tidy:
 	go mod tidy
 
 clean:
-	rm -f $(BIN) testmsg readroom
-	rm -rf data/
+	rm -f mosaic mosaic-bin testmsg readroom
