@@ -1,12 +1,411 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <title>Mosaic — Tasks (placeholder)</title>
-  </head>
-  <body>
-    <h1>Mosaic Task Board (placeholder)</h1>
-    <p>The kanban UI lands in PR #3. The REST API is live now —
-       try <code>curl /api/v1/projects</code> with the token.</p>
-  </body>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Mosaic — Tasks</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif; }
+    .col-scroll::-webkit-scrollbar { width: 6px; }
+    .col-scroll::-webkit-scrollbar-thumb { background: rgba(0,0,0,.15); border-radius: 3px; }
+    .card { transition: box-shadow .12s ease, transform .12s ease; }
+    .card:hover { box-shadow: 0 4px 12px rgba(0,0,0,.08); }
+    .card.dragging { opacity: .4; }
+    .col-drop { transition: background .12s ease; }
+    .col-drop.over { background: rgba(59,130,246,.08); }
+    /* Hide spinner on number inputs */
+    input::-webkit-outer-spin-button, input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-800">
+
+<header class="border-b bg-white px-6 py-3 flex items-center gap-4 sticky top-0 z-20 shadow-sm">
+  <div class="font-semibold tracking-tight">Mosaic Tasks</div>
+  <select id="project-picker" class="border rounded px-2 py-1 text-sm bg-white"></select>
+  <div class="flex-1"></div>
+  <label class="text-xs text-slate-500 flex items-center gap-1">
+    <input type="checkbox" id="show-cancelled" class="align-middle" /> show cancelled
+  </label>
+  <button id="refresh-btn" class="text-xs text-slate-500 hover:text-slate-800 px-2 py-1 border rounded">↻ refresh</button>
+  <span id="status" class="text-xs text-slate-400"></span>
+</header>
+
+<main id="board" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4 p-4"></main>
+
+<!-- Editor drawer -->
+<div id="drawer" class="fixed inset-0 z-30 hidden">
+  <div class="absolute inset-0 bg-black/30" data-close></div>
+  <aside class="absolute right-0 top-0 bottom-0 w-full max-w-xl bg-white shadow-2xl overflow-y-auto">
+    <div class="px-6 py-4 border-b flex items-center gap-3">
+      <span id="drawer-id" class="font-mono text-xs text-slate-400"></span>
+      <h2 id="drawer-mode" class="font-medium">Edit task</h2>
+      <div class="flex-1"></div>
+      <button data-close class="text-slate-400 hover:text-slate-700">✕</button>
+    </div>
+    <form id="task-form" class="px-6 py-4 space-y-4">
+      <div>
+        <label class="block text-xs uppercase tracking-wide text-slate-500 mb-1">Title</label>
+        <input name="title" required class="w-full border rounded px-3 py-2" placeholder="What needs doing?" />
+      </div>
+      <div>
+        <label class="block text-xs uppercase tracking-wide text-slate-500 mb-1">Description</label>
+        <textarea name="description" rows="6" class="w-full border rounded px-3 py-2 font-mono text-sm" placeholder="Markdown…"></textarea>
+      </div>
+      <div class="grid grid-cols-2 gap-4">
+        <div>
+          <label class="block text-xs uppercase tracking-wide text-slate-500 mb-1">State</label>
+          <select name="state" class="w-full border rounded px-3 py-2"></select>
+        </div>
+        <div>
+          <label class="block text-xs uppercase tracking-wide text-slate-500 mb-1">Assignee</label>
+          <select name="assignee" class="w-full border rounded px-3 py-2"></select>
+        </div>
+      </div>
+      <div>
+        <label class="block text-xs uppercase tracking-wide text-slate-500 mb-1">Labels (comma separated)</label>
+        <input name="labels" class="w-full border rounded px-3 py-2" placeholder="bug, perf" />
+      </div>
+      <div class="flex items-center gap-2 pt-2 border-t">
+        <button type="submit" class="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700">Save</button>
+        <button type="button" data-close class="px-4 py-2 rounded hover:bg-slate-100">Cancel</button>
+        <div class="flex-1"></div>
+        <button type="button" id="delete-btn" class="hidden text-sm text-red-600 hover:text-red-800 px-3 py-1">
+          Delete (shift = purge)
+        </button>
+      </div>
+      <p id="form-err" class="text-sm text-red-600 hidden"></p>
+    </form>
+  </aside>
+</div>
+
+<script>
+'use strict';
+
+// ---- config ----
+const params = new URLSearchParams(location.search);
+const TOKEN = params.get('token') || '';
+let SPACE_ID = params.get('space') || '';
+
+const STATES = [
+  { key: 'backlog',     label: 'Backlog',     accent: 'bg-slate-100' },
+  { key: 'todo',        label: 'To Do',       accent: 'bg-blue-50' },
+  { key: 'in_progress', label: 'In Progress', accent: 'bg-amber-50' },
+  { key: 'in_review',   label: 'In Review',   accent: 'bg-violet-50' },
+  { key: 'done',        label: 'Done',        accent: 'bg-emerald-50' },
+];
+
+// ---- DOM helpers ----
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+const el = (tag, attrs = {}, ...kids) => {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === 'class') n.className = v;
+    else if (k.startsWith('on') && typeof v === 'function') n.addEventListener(k.slice(2), v);
+    else if (v !== undefined && v !== null) n.setAttribute(k, v);
+  }
+  for (const kid of kids) {
+    if (kid == null) continue;
+    n.append(kid.nodeType ? kid : document.createTextNode(kid));
+  }
+  return n;
+};
+const setStatus = (s) => { $('#status').textContent = s || ''; };
+
+// ---- API ----
+const api = async (method, path, body) => {
+  const r = await fetch(path, {
+    method,
+    headers: {
+      'Authorization': 'Bearer ' + TOKEN,
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (r.status === 204) return null;
+  const text = await r.text();
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch (e) { /* leave null */ }
+  if (!r.ok) {
+    const msg = (json && json.error) ? json.error : (text || r.statusText);
+    throw new Error(`${r.status}: ${msg}`);
+  }
+  return json;
+};
+
+// ---- state ----
+let projects = [];
+let agents = [];
+let tasks = [];
+
+// ---- bootstrap ----
+async function init() {
+  if (!TOKEN) {
+    document.body.innerHTML = '<p class="p-8 text-red-600">missing ?token= — see ~/.mosaic/data/web.token</p>';
+    return;
+  }
+  try {
+    [projects, agents] = await Promise.all([api('GET', '/api/v1/projects'), Promise.resolve([])]);
+    if (projects.length === 0) {
+      $('#board').innerHTML = '<p class="col-span-5 text-slate-500 p-8">no projects configured — add a <code>projects</code> entry to config.yaml with <code>task_prefix</code></p>';
+      return;
+    }
+    if (!SPACE_ID || !projects.find(p => p.space_id === SPACE_ID)) {
+      SPACE_ID = projects[0].space_id;
+      replaceURL();
+    }
+    populateProjectPicker();
+    await loadAgents();
+    await refresh();
+  } catch (e) {
+    setStatus('error: ' + e.message);
+  }
+}
+
+function replaceURL() {
+  const u = new URL(location.href);
+  u.searchParams.set('space', SPACE_ID);
+  history.replaceState({}, '', u);
+}
+
+function populateProjectPicker() {
+  const sel = $('#project-picker');
+  sel.innerHTML = '';
+  for (const p of projects) {
+    const opt = el('option', { value: p.space_id }, p.name || p.space_id);
+    if (p.space_id === SPACE_ID) opt.selected = true;
+    sel.append(opt);
+  }
+  sel.onchange = async () => {
+    SPACE_ID = sel.value;
+    replaceURL();
+    await loadAgents();
+    await refresh();
+  };
+}
+
+async function loadAgents() {
+  agents = await api('GET', `/api/v1/projects/${encodeURIComponent(SPACE_ID)}/agents`);
+}
+
+async function refresh() {
+  setStatus('loading…');
+  try {
+    tasks = await api('GET', `/api/v1/projects/${encodeURIComponent(SPACE_ID)}/tasks`);
+    render();
+    setStatus('');
+  } catch (e) {
+    setStatus('error: ' + e.message);
+  }
+}
+
+// ---- render ----
+function render() {
+  const showCancelled = $('#show-cancelled').checked;
+  const board = $('#board');
+  board.innerHTML = '';
+
+  const cols = [...STATES];
+  if (showCancelled) cols.push({ key: 'cancelled', label: 'Cancelled', accent: 'bg-rose-50' });
+
+  for (const col of cols) {
+    const colTasks = tasks.filter(t => t.state === col.key);
+    const head = el('div', { class: 'flex items-center gap-2 px-2 py-1' },
+      el('h3', { class: 'font-medium text-sm tracking-tight text-slate-700' }, col.label),
+      el('span', { class: 'text-xs text-slate-400' }, String(colTasks.length)),
+    );
+    const list = el('div', { class: 'space-y-2 col-scroll min-h-[200px] flex-1 overflow-y-auto pr-1' });
+    for (const t of colTasks) list.append(renderCard(t));
+    const addBtn = el('button',
+      { class: 'w-full mt-2 text-xs text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded py-2 border border-dashed',
+        onclick: () => openCreate(col.key) },
+      '+ add task');
+
+    const colEl = el('section',
+      { class: `col-drop ${col.accent} rounded-lg p-3 flex flex-col`, 'data-state': col.key },
+      head, list, addBtn);
+
+    // HTML5 drop targets
+    colEl.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      colEl.classList.add('over');
+    });
+    colEl.addEventListener('dragleave', () => colEl.classList.remove('over'));
+    colEl.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      colEl.classList.remove('over');
+      const id = e.dataTransfer.getData('text/plain');
+      if (!id) return;
+      const t = tasks.find(x => x.id === id);
+      if (!t || t.state === col.key) return;
+      try {
+        const updated = await api('PATCH',
+          `/api/v1/projects/${encodeURIComponent(SPACE_ID)}/tasks/${encodeURIComponent(id)}`,
+          { state: col.key });
+        // Optimistic local update so the card jumps without a full reload.
+        Object.assign(t, updated);
+        render();
+      } catch (err) {
+        setStatus('move failed: ' + err.message);
+      }
+    });
+
+    board.append(colEl);
+  }
+}
+
+function renderCard(t) {
+  const card = el('article',
+    { class: 'card bg-white rounded shadow-sm p-3 cursor-pointer border border-slate-200',
+      draggable: 'true',
+      onclick: () => openEdit(t) },
+    el('div', { class: 'flex items-baseline gap-2' },
+      el('span', { class: 'font-mono text-[10px] text-slate-400' }, t.id),
+      el('span', { class: 'flex-1' }),
+      t.assignee ? el('span', { class: 'text-[10px] text-slate-500' }, displayName(t.assignee)) : null,
+    ),
+    el('div', { class: 'mt-1 text-sm leading-snug' }, t.title),
+    (t.labels && t.labels.length) ? el('div', { class: 'mt-2 flex flex-wrap gap-1' },
+      ...t.labels.map(l => el('span',
+        { class: 'text-[10px] bg-slate-100 text-slate-600 rounded px-1.5 py-0.5' }, l))
+    ) : null,
+  );
+  card.addEventListener('dragstart', (e) => {
+    card.classList.add('dragging');
+    e.dataTransfer.setData('text/plain', t.id);
+    e.dataTransfer.effectAllowed = 'move';
+  });
+  card.addEventListener('dragend', () => card.classList.remove('dragging'));
+  return card;
+}
+
+function displayName(userID) {
+  const a = agents.find(x => x.user_id === userID);
+  return a ? (a.display_name || a.user_id) : userID;
+}
+
+// ---- drawer ----
+let editingID = null;
+
+function openCreate(state) {
+  editingID = null;
+  $('#drawer-id').textContent = '(new)';
+  $('#drawer-mode').textContent = 'New task';
+  fillForm({ title: '', description: '', state, assignee: '', labels: [] });
+  $('#delete-btn').classList.add('hidden');
+  showDrawer();
+}
+
+function openEdit(t) {
+  editingID = t.id;
+  $('#drawer-id').textContent = t.id;
+  $('#drawer-mode').textContent = 'Edit task';
+  fillForm(t);
+  $('#delete-btn').classList.remove('hidden');
+  showDrawer();
+}
+
+function fillForm(t) {
+  populateStateSelect();
+  populateAssigneeSelect();
+  const f = $('#task-form');
+  f.title.value = t.title || '';
+  f.description.value = t.description || '';
+  f.state.value = t.state || 'backlog';
+  f.assignee.value = t.assignee || '';
+  f.labels.value = (t.labels || []).join(', ');
+  $('#form-err').classList.add('hidden');
+}
+
+function populateStateSelect() {
+  const sel = $('#task-form select[name=state]');
+  sel.innerHTML = '';
+  for (const s of [...STATES, { key: 'cancelled', label: 'Cancelled' }]) {
+    sel.append(el('option', { value: s.key }, s.label));
+  }
+}
+
+function populateAssigneeSelect() {
+  const sel = $('#task-form select[name=assignee]');
+  sel.innerHTML = '';
+  sel.append(el('option', { value: '' }, '— unassigned —'));
+  for (const a of agents) {
+    sel.append(el('option', { value: a.user_id },
+      `${a.display_name || a.user_id}${a.online ? '' : ' (offline)'}`));
+  }
+}
+
+function showDrawer() { $('#drawer').classList.remove('hidden'); }
+function hideDrawer() { $('#drawer').classList.add('hidden'); }
+
+$$('#drawer [data-close]').forEach(b => b.addEventListener('click', hideDrawer));
+
+$('#task-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  const body = {
+    title: f.title.value.trim(),
+    description: f.description.value,
+    state: f.state.value,
+    assignee: f.assignee.value,
+    labels: f.labels.value.split(',').map(s => s.trim()).filter(Boolean),
+  };
+  try {
+    if (editingID) {
+      const updated = await api('PATCH',
+        `/api/v1/projects/${encodeURIComponent(SPACE_ID)}/tasks/${encodeURIComponent(editingID)}`, body);
+      const i = tasks.findIndex(t => t.id === editingID);
+      if (i >= 0) tasks[i] = updated;
+    } else {
+      const created = await api('POST',
+        `/api/v1/projects/${encodeURIComponent(SPACE_ID)}/tasks`, body);
+      tasks.push(created);
+    }
+    hideDrawer();
+    render();
+  } catch (err) {
+    const e = $('#form-err');
+    e.textContent = err.message;
+    e.classList.remove('hidden');
+  }
+});
+
+$('#delete-btn').addEventListener('click', async (e) => {
+  if (!editingID) return;
+  const purge = e.shiftKey;
+  const msg = purge
+    ? `Permanently purge ${editingID}? This cannot be undone.`
+    : `Mark ${editingID} as cancelled? (shift+click to permanently purge)`;
+  if (!confirm(msg)) return;
+  try {
+    const url = `/api/v1/projects/${encodeURIComponent(SPACE_ID)}/tasks/${encodeURIComponent(editingID)}`
+      + (purge ? '?purge=true' : '');
+    await api('DELETE', url);
+    if (purge) {
+      tasks = tasks.filter(t => t.id !== editingID);
+    } else {
+      const i = tasks.findIndex(t => t.id === editingID);
+      if (i >= 0) tasks[i].state = 'cancelled';
+    }
+    hideDrawer();
+    render();
+  } catch (err) {
+    const e = $('#form-err');
+    e.textContent = err.message;
+    e.classList.remove('hidden');
+  }
+});
+
+$('#refresh-btn').addEventListener('click', refresh);
+$('#show-cancelled').addEventListener('change', render);
+
+// Light auto-refresh so multiple users / dispatcher state changes
+// surface without a manual reload. 10s is gentle enough on the
+// single-process backend.
+setInterval(() => { if (!document.hidden) refresh(); }, 10000);
+
+init();
+</script>
+</body>
 </html>
