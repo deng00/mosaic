@@ -98,6 +98,10 @@ type Options struct {
 	// remain accessible to anyone in the room.
 	Members []string
 
+	// Env is extra KEY=VALUE pairs injected into every spawned
+	// claude subprocess. Useful for CLAUDE_CODE_OAUTH_TOKEN etc.
+	Env map[string]string
+
 	// ServerName is our own Matrix server (e.g. "localhost"). Used
 	// to fold the `:server` suffix off displayed room/user IDs that
 	// belong to us — purely a UI sweetener.
@@ -1325,6 +1329,7 @@ func (b *Bridge) getOrCreate(ctx context.Context, roomID id.RoomID) *roomSession
 		PermissionMode:     b.opts.PermissionMode,
 		Binary:             b.opts.Binary,
 		Resume:             resume,
+		ExtraEnv:           envMapToSlice(b.opts.Env),
 		AppendSystemPrompt: appendSP,
 	})
 	if err != nil {
@@ -1416,4 +1421,15 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+func envMapToSlice(m map[string]string) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(m))
+	for k, v := range m {
+		out = append(out, k+"="+v)
+	}
+	return out
 }

@@ -119,6 +119,7 @@ type ClaudeConfig struct {
 	Model              string `yaml:"model"`
 	PermissionMode     string `yaml:"permission_mode"`     // default "bypassPermissions"
 	AppendSystemPrompt string `yaml:"append_system_prompt,omitempty"`
+	Env                map[string]string `yaml:"env,omitempty"`
 }
 
 type ProjectConfigYAML struct {

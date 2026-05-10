@@ -79,6 +79,10 @@ type Options struct {
 
 	// Binary overrides the executable path; defaults to "claude".
 	Binary string
+
+	// ExtraEnv pairs (KEY=VALUE) appended to os.Environ() when claude spawns.
+	// Useful for CLAUDE_CODE_OAUTH_TOKEN and other claude-side secrets.
+	ExtraEnv []string
 }
 
 // Process is a running claude subprocess wired for stream-json I/O.
@@ -229,7 +233,7 @@ func Spawn(ctx context.Context, opts Options) (*Process, error) {
 	if err != nil {
 		return nil, err
 	}
-	return SpawnRaw(ctx, bin, args, nil, opts.Cwd)
+	return SpawnRaw(ctx, bin, args, opts.ExtraEnv, opts.Cwd)
 }
 
 

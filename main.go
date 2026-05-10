@@ -178,6 +178,7 @@ func runBot(ctx context.Context, fc *FileConfig, bc BotConfig, mgr *AgentRuntime
 		Admins:         fc.Admins,
 		Members:        fc.Members,
 		ServerName:     fc.ServerName,
+		Env:            bc.Claude.Env,
 	})
 	if mgr != nil {
 		mgr.trackBridge(br)
