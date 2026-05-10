@@ -80,6 +80,11 @@ type FileConfig struct {
 	// project values for that single room. Use sparingly — a one-off
 	// experiment room or sandbox.
 	Rooms map[string]RoomConfigYAML `yaml:"rooms,omitempty"`
+
+	// Web exposes the task board over HTTP. Opt-in: when disabled the
+	// board / REST API don't bind at all. The bearer token persists at
+	// <data_dir>/web.token across restarts.
+	Web WebConfigYAML `yaml:"web,omitempty"`
 }
 
 // AllAgents returns the configured agents.
@@ -126,6 +131,18 @@ type ProjectConfigYAML struct {
 	Name  string `yaml:"name,omitempty"`
 	Cwd   string `yaml:"cwd,omitempty"`
 	Model string `yaml:"model,omitempty"`
+	// TaskPrefix is the per-project ticket-id prefix, e.g. "MOS" makes
+	// task ids look like MOS-1, MOS-2. Required when the web task
+	// board is enabled and tasks are created against this project.
+	TaskPrefix string `yaml:"task_prefix,omitempty"`
+}
+
+// WebConfigYAML controls the task-board HTTP server. Enabled is opt-in;
+// the rest have sane defaults (bind 127.0.0.1, port 24527).
+type WebConfigYAML struct {
+	Enabled bool   `yaml:"enabled"`
+	Bind    string `yaml:"bind,omitempty"`
+	Port    int    `yaml:"port,omitempty"`
 }
 
 type RoomConfigYAML struct {

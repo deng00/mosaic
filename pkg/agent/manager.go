@@ -23,12 +23,15 @@ type CreateRequest struct {
 	Runtime     string // reserved: which CodingAgent to spawn (default "claude")
 }
 
-// ProjectInfo is what /project list / /project status surface.
+// ProjectInfo is what /project list / /project status surface, and
+// the snapshot the task board's HTTP layer reads to resolve a Space →
+// task_prefix.
 type ProjectInfo struct {
-	SpaceID string
-	Name    string
-	Cwd     string
-	Model   string
+	SpaceID    string
+	Name       string
+	Cwd        string
+	Model      string
+	TaskPrefix string
 }
 
 // AgentManager is the bridge's view onto the runtime: enumerate /

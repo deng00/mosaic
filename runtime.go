@@ -15,6 +15,7 @@ import (
 
 	"github.com/deng00/mosaic/pkg/agent"
 	"github.com/deng00/mosaic/pkg/registrar"
+	"github.com/deng00/mosaic/pkg/task"
 )
 
 // AgentRuntime tracks all currently configured agents, supports hot
@@ -32,6 +33,11 @@ type AgentRuntime struct {
 	running map[string]*runningAgent
 	bridges []*agent.Bridge // pumped on /project mutations
 	wg      *sync.WaitGroup
+
+	// tasks is the per-project kanban store; populated by main.go
+	// after construction. nil-safe: AgentRuntime doesn't read it
+	// directly, but downstream code (dispatcher, web) does.
+	tasks *task.Store
 }
 
 type runningAgent struct {
@@ -306,10 +312,11 @@ func (r *AgentRuntime) Projects() []agent.ProjectInfo {
 	out := make([]agent.ProjectInfo, 0, len(r.cfg.Projects))
 	for sid, pc := range r.cfg.Projects {
 		out = append(out, agent.ProjectInfo{
-			SpaceID: sid,
-			Name:    pc.Name,
-			Cwd:     pc.Cwd,
-			Model:   pc.Model,
+			SpaceID:    sid,
+			Name:       pc.Name,
+			Cwd:        pc.Cwd,
+			Model:      pc.Model,
+			TaskPrefix: pc.TaskPrefix,
 		})
 	}
 	return out
