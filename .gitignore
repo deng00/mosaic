@@ -1,0 +1,15 @@
+# Build artefacts
+/mosaic
+/testmsg
+/readroom
+
+# Local runtime / state (real config + data lives in ~/.mosaic/)
+/data/
+/logs/
+/.env
+
+# Editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
