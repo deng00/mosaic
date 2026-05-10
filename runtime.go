@@ -234,7 +234,69 @@ func writeConfig(path string, fc *FileConfig) error {
 func (r *AgentRuntime) trackBridge(b *agent.Bridge) {
 	r.mu.Lock()
 	r.bridges = append(r.bridges, b)
+	// Make sure the new bridge starts with the live members list.
+	members := append([]string(nil), r.cfg.Members...)
 	r.mu.Unlock()
+	b.UpdateMembers(members)
+}
+
+// Members implements agent.AgentManager.Members.
+func (r *AgentRuntime) Members() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.cfg.Members...)
+}
+
+// AddMember implements agent.AgentManager.AddMember. Idempotent.
+func (r *AgentRuntime) AddMember(userID string) error {
+	if userID == "" {
+		return fmt.Errorf("userID required")
+	}
+	r.mu.Lock()
+	for _, m := range r.cfg.Members {
+		if m == userID {
+			r.mu.Unlock()
+			return nil // already in
+		}
+	}
+	r.cfg.Members = append(r.cfg.Members, userID)
+	if err := writeConfig(r.cfgPath, r.cfg); err != nil {
+		r.mu.Unlock()
+		return err
+	}
+	members := append([]string(nil), r.cfg.Members...)
+	bridges := append([]*agent.Bridge(nil), r.bridges...)
+	r.mu.Unlock()
+	for _, b := range bridges {
+		b.UpdateMembers(members)
+	}
+	return nil
+}
+
+// RemoveMember implements agent.AgentManager.RemoveMember. Idempotent.
+func (r *AgentRuntime) RemoveMember(userID string) error {
+	if userID == "" {
+		return fmt.Errorf("userID required")
+	}
+	r.mu.Lock()
+	out := r.cfg.Members[:0]
+	for _, m := range r.cfg.Members {
+		if m != userID {
+			out = append(out, m)
+		}
+	}
+	r.cfg.Members = out
+	if err := writeConfig(r.cfgPath, r.cfg); err != nil {
+		r.mu.Unlock()
+		return err
+	}
+	members := append([]string(nil), r.cfg.Members...)
+	bridges := append([]*agent.Bridge(nil), r.bridges...)
+	r.mu.Unlock()
+	for _, b := range bridges {
+		b.UpdateMembers(members)
+	}
+	return nil
 }
 
 // Projects implements agent.AgentManager.Projects.

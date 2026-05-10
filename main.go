@@ -154,6 +154,7 @@ func runBot(ctx context.Context, fc *FileConfig, bc BotConfig, mgr *AgentRuntime
 		Memory:         agent.NewMemory(dataDir, projectsDataDir(fc.DataDir)),
 		Manager:        mgr,
 		Admins:         fc.Admins,
+		Members:        fc.Members,
 		ServerName:     fc.ServerName,
 	})
 	if mgr != nil {

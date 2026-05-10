@@ -55,8 +55,16 @@ type FileConfig struct {
 	Agents []BotConfig `yaml:"agents"`
 
 	// Admins are the full Matrix user IDs allowed to run management
-	// slash commands like /agent new. Anyone else gets a polite no.
+	// slash commands like /agent new. Always implicitly allowed to
+	// drive agents.
 	Admins []string `yaml:"admins,omitempty"`
+
+	// Members are non-admin Matrix user IDs allowed to chat with /
+	// drive agents. Empty = admin-only (paranoid default — random
+	// users from the same homeserver who somehow end up in a room
+	// with the agent get a polite refusal). Use /agent allow @user
+	// from chat to extend.
+	Members []string `yaml:"members,omitempty"`
 
 	// SharedSecret is Synapse's registration_shared_secret (copied
 	// verbatim from homeserver.yaml). Used by /agent new to register

@@ -87,8 +87,16 @@ type Options struct {
 	Manager AgentManager
 
 	// Admins are full Matrix user IDs allowed to run /agent new and
-	// other management commands. Anyone else gets a polite refusal.
+	// other management commands. Always implicitly allowed to drive
+	// agents (no need to also list in Members).
 	Admins []string
+
+	// Members are non-admin Matrix user IDs allowed to chat with /
+	// drive the agent (claude turns + tier-2 slashes like
+	// /new-session, /compact). Empty = admin-only. Read-only commands
+	// (/help, /status, /agent help|list, /project help|status|list)
+	// remain accessible to anyone in the room.
+	Members []string
 
 	// ServerName is our own Matrix server (e.g. "localhost"). Used
 	// to fold the `:server` suffix off displayed room/user IDs that
@@ -134,6 +142,15 @@ func (b *Bridge) InvalidateResolutions(projects map[string]ProjectConfig, rooms 
 	if rooms != nil {
 		b.opts.Rooms = rooms
 	}
+	b.mu.Unlock()
+}
+
+// UpdateMembers swaps in a new allow-list. Called from the manager
+// after /agent allow / /agent revoke so the new value is visible to
+// every running bridge without an agent restart.
+func (b *Bridge) UpdateMembers(members []string) {
+	b.mu.Lock()
+	b.opts.Members = members
 	b.mu.Unlock()
 }
 
@@ -258,11 +275,26 @@ func (b *Bridge) handleMessage(ctx context.Context, roomID id.RoomID, eventID id
 	// and `!foo` are accepted — Element's web UI shows an "Unknown
 	// Command" warning on `/`-prefix sends, so `!` is the noise-free
 	// alternative.
-	if strings.HasPrefix(text, "/") || strings.HasPrefix(text, "!") {
-		dispatch := text
-		if strings.HasPrefix(text, "!") {
-			dispatch = "/" + text[1:]
-		}
+	dispatch := text
+	if strings.HasPrefix(text, "!") {
+		dispatch = "/" + text[1:]
+	}
+	isSlash := strings.HasPrefix(dispatch, "/")
+
+	// ACL: only admins + listed members may drive the agent. Read-only
+	// slash commands (/help / /status / list-style queries) bypass the
+	// gate so a stranger can at least see they're not authorized.
+	if !b.isAllowed(sender) && !(isSlash && isReadOnlySlash(dispatch)) {
+		log.Printf("[agent] denied: %s (not in admins/members)", sender)
+		_, _ = b.mx.SendText(context.Background(), roomID, fmt.Sprintf(
+			"🔒 你（%s）不在本 agent 的访问名单。请联系管理员（%s）加白：`/agent allow %s`",
+			FoldHomeServer(string(sender), b.opts.ServerName),
+			strings.Join(b.opts.Admins, ", "),
+			FoldHomeServer(string(sender), b.opts.ServerName)))
+		return
+	}
+
+	if isSlash {
 		if handled := b.handleSlash(roomID, sender, dispatch); handled {
 			return
 		}
@@ -283,6 +315,24 @@ func (b *Bridge) handleMessage(ctx context.Context, roomID id.RoomID, eventID id
 		_, _ = b.mx.SendText(context.Background(), roomID,
 			"⏳ 排队太多了，暂时无法接收。请稍候再试。")
 	}
+}
+
+// isReadOnlySlash returns true for slashes any room member is allowed
+// to invoke (queries / help, no state mutation, no claude spawn).
+// Anything else (claude turns + state-mutating slashes) requires
+// isAllowed.
+func isReadOnlySlash(text string) bool {
+	cmd := strings.TrimSpace(text)
+	if i := strings.IndexAny(cmd, " \t"); i > 0 {
+		cmd = cmd[:i]
+	}
+	switch cmd {
+	case "/help", "/status", "/agent", "/project":
+		// /agent and /project sub-dispatch their own ACL — list/help
+		// is fine; mutating subs (new / set-cwd / allow) re-check.
+		return true
+	}
+	return false
 }
 
 // handleSlash returns true when the input was a recognized slash
@@ -431,6 +481,76 @@ func (b *Bridge) handleAgentSlash(ctx context.Context, roomID id.RoomID, sender 
 			info.DeviceName, info.UserID, info.ID, info.ID, info.UserID))
 		return true
 
+	case "members":
+		// Show the current allow-list (admins + members). Anyone in
+		// the room can run this — useful for "why am I being denied?".
+		var sb strings.Builder
+		sb.WriteString("**访问名单**\n\n")
+		sb.WriteString("**Admins** (always allowed, can run /agent new etc.):\n")
+		for _, a := range b.opts.Admins {
+			fmt.Fprintf(&sb, "- `%s`\n", FoldHomeServer(a, b.opts.ServerName))
+		}
+		sb.WriteString("\n**Members** (allowed to drive agents, no admin power):\n")
+		members := b.opts.Members
+		if b.opts.Manager != nil {
+			members = b.opts.Manager.Members() // live config
+		}
+		if len(members) == 0 {
+			sb.WriteString("_(空 — 仅 admins 可用)_\n")
+		} else {
+			for _, m := range members {
+				fmt.Fprintf(&sb, "- `%s`\n", FoldHomeServer(m, b.opts.ServerName))
+			}
+		}
+		_, _ = b.mx.SendText(ctx, roomID, sb.String())
+		return true
+
+	case "allow":
+		if !b.isAdmin(sender) {
+			_, _ = b.mx.SendText(ctx, roomID, "⛔ `/agent allow` 需要管理员权限")
+			return true
+		}
+		if b.opts.Manager == nil {
+			_, _ = b.mx.SendText(ctx, roomID, "⚠️ manager unavailable")
+			return true
+		}
+		if rest == "" {
+			_, _ = b.mx.SendText(ctx, roomID, "用法：`/agent allow @user:server`（短形式 `@user` 也行）")
+			return true
+		}
+		uid := ExpandHomeServer(rest, b.opts.ServerName)
+		if err := b.opts.Manager.AddMember(uid); err != nil {
+			_, _ = b.mx.SendText(ctx, roomID, "❌ "+err.Error())
+			return true
+		}
+		_, _ = b.mx.SendText(ctx, roomID, fmt.Sprintf(
+			"✅ 已加白 `%s`，现在 ta 可以 @ 任意 agent 聊天 / 跑 `/new-session` 等。",
+			FoldHomeServer(uid, b.opts.ServerName)))
+		return true
+
+	case "revoke":
+		if !b.isAdmin(sender) {
+			_, _ = b.mx.SendText(ctx, roomID, "⛔ `/agent revoke` 需要管理员权限")
+			return true
+		}
+		if b.opts.Manager == nil {
+			_, _ = b.mx.SendText(ctx, roomID, "⚠️ manager unavailable")
+			return true
+		}
+		if rest == "" {
+			_, _ = b.mx.SendText(ctx, roomID, "用法：`/agent revoke @user:server`")
+			return true
+		}
+		uid := ExpandHomeServer(rest, b.opts.ServerName)
+		if err := b.opts.Manager.RemoveMember(uid); err != nil {
+			_, _ = b.mx.SendText(ctx, roomID, "❌ "+err.Error())
+			return true
+		}
+		_, _ = b.mx.SendText(ctx, roomID, fmt.Sprintf(
+			"✅ 已从白名单移除 `%s`",
+			FoldHomeServer(uid, b.opts.ServerName)))
+		return true
+
 	default:
 		_, _ = b.mx.SendText(ctx, roomID,
 			"未知子命令 `"+subcmd+"`。试 `/agent help`。")
@@ -441,6 +561,22 @@ func (b *Bridge) handleAgentSlash(ctx context.Context, roomID id.RoomID, sender 
 func (b *Bridge) isAdmin(sender id.UserID) bool {
 	for _, a := range b.opts.Admins {
 		if a == string(sender) {
+			return true
+		}
+	}
+	return false
+}
+
+// isAllowed = admin OR explicitly listed in Members. Used to gate
+// claude turns and state-mutating slash commands. Default (Members
+// empty) is admin-only.
+func (b *Bridge) isAllowed(sender id.UserID) bool {
+	if b.isAdmin(sender) {
+		return true
+	}
+	s := string(sender)
+	for _, m := range b.opts.Members {
+		if m == s {
 			return true
 		}
 	}
@@ -678,6 +814,9 @@ const agentSlashHelp = `**` + "`/agent`" + ` 命令家族**
 
 - ` + "`/agent list`" + ` — 列出所有已配置 agent + 在线状态
 - ` + "`/agent new <localpart> [display name]`" + ` — 创建新 agent（注册 Matrix 账号 + 写 config + 即时上线 + 创建 ` + "`MEMORY.md`" + ` 模板）⛔ admin only
+- ` + "`/agent members`" + ` — 显示访问名单（admins + members）
+- ` + "`/agent allow @user`" + ` — 加白：让该用户可以驱动 agent（claude 对话 + tier-2 slashes）⛔ admin only
+- ` + "`/agent revoke @user`" + ` — 从白名单移除 ⛔ admin only
 - ` + "`/agent help`" + ` — 这条帮助
 
 新 agent 的 ` + "`MEMORY.md`" + ` 是其 persona / role：

@@ -18,6 +18,47 @@
                        每个 agent 各自跑一个 Claude Code subprocess
 ```
 
+## 三种部署模式
+
+| | 谁来管 server | 谁来跑 mosaic | claude 跑哪 | 隔离度 | 适合 |
+|---|---|---|---|---|---|
+| **A. 完全独立部署** | 你自己 | 你自己 | 你的机器 | 完全 | 单人 / 单团队，**默认推荐**——最简单、最安全、最可控 |
+| **B. 纯 Element 用户** | 别人 | 别人（你不跑 mosaic） | 别人的机器 | 共享 admin 的 agents | 想用同事的 agents 帮你查东西，不需要自己的 agent |
+| **C. 共享 server，自跑 mosaic** | 别人 | 你自己 | 你的机器 | 你的 agents 私有 | 你想要自己的 agents 操作**你本机**代码，但和同事共用 Matrix 网络（消息互通） |
+
+下面 "快速开始" 默认讲 **A**。B 和 C 在本文末尾"给加入别人 server 的同事用"一节。
+
+## 访问控制
+
+默认 **paranoid**：mosaic 起来时只有 `admins` 列表里的用户能驱动 agent。其他用户（即使在同一 room）发消息会得到 `🔒 不在访问名单` 的拒绝（不会触发 claude，不烧钱）。
+
+授权别人用你的 agent 的两种方式：
+
+```
+# 方式 1：在聊天里（推荐）
+!agent allow @colleague:server          # admin 命令
+# 立刻生效，下次 ta 发消息正常进 claude
+
+# 方式 2：编辑 ~/.mosaic/config.yaml
+members:
+  - "@colleague:server"
+# 然后 launchctl kickstart 或重启 mosaic
+```
+
+回收：
+
+```
+!agent revoke @colleague:server
+```
+
+查看当前名单：
+
+```
+!agent members
+```
+
+—— 即便 `@colleague:server` 跟你在同一个 Space / room 里、是 Matrix room 成员，**没有显式加白也驱动不了你的 agent**。Matrix room invite 控制的是"看得到消息"，mosaic 的 ACL 控制的是"能不能命令 agent 干活"，两层独立。
+
 ## 设计速记
 
 - **三层 Matrix 结构**：Org Space (`CoinSummer`) → Project Space (`cs-argus-agent`) → Topic Room (`feat-acl-rewrite` / `daily-ops`)
@@ -97,6 +138,11 @@ data_dir: data                     # 相对 ~/.mosaic 解析
 
 admins:
   - "@danny:localhost"
+
+# Members（可选）：非 admin 的允许驱动 agent 的用户。
+# 留空 = 仅 admin 可用（paranoid 默认）。
+# 也可以运行时用 /agent allow @user 加白。
+members: []
 
 # 从 Synapse 的 homeserver.yaml 拷过来
 registration_shared_secret: "..."

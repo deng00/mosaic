@@ -48,4 +48,15 @@ type AgentManager interface {
 	// and invalidates per-room resolution caches so changes take
 	// effect on the next claude spawn.
 	SetProject(spaceID, name, cwd, model string) error
+
+	// Members returns the current allow-list (non-admin users
+	// authorised to drive agents). Admins are NOT included here —
+	// callers should check Admins separately or use Bridge.isAllowed.
+	Members() []string
+
+	// AddMember / RemoveMember edit the allow-list and persist to
+	// config.yaml. Both are idempotent. Broadcasts the new list to
+	// all running bridges so /agent allow takes effect immediately.
+	AddMember(userID string) error
+	RemoveMember(userID string) error
 }
