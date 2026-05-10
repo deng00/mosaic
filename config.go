@@ -135,6 +135,27 @@ type ProjectConfigYAML struct {
 	// task ids look like MOS-1, MOS-2. Required when the web task
 	// board is enabled and tasks are created against this project.
 	TaskPrefix string `yaml:"task_prefix,omitempty"`
+
+	// WorkspaceRoot is where this project's per-task isolated
+	// workspaces live. Defaults to <data_dir>/workspaces. Each task
+	// gets <root>/<task-id>/.
+	WorkspaceRoot string `yaml:"workspace_root,omitempty"`
+
+	// WorkspaceHooks are bash scripts the dispatcher runs around
+	// workspace lifecycle (after_create / before_run / after_run /
+	// before_remove). after_create is the canonical place to put a
+	// `git clone <repo> .` so the agent has source to work on.
+	WorkspaceHooks WorkspaceHooksYAML `yaml:"workspace_hooks,omitempty"`
+}
+
+// WorkspaceHooksYAML mirrors workspace.Hooks for YAML unmarshalling.
+// Strings are bash -lc scripts run with cwd = workspace path.
+type WorkspaceHooksYAML struct {
+	AfterCreate  string `yaml:"after_create,omitempty"`
+	BeforeRun    string `yaml:"before_run,omitempty"`
+	AfterRun     string `yaml:"after_run,omitempty"`
+	BeforeRemove string `yaml:"before_remove,omitempty"`
+	TimeoutMS    int    `yaml:"timeout_ms,omitempty"`
 }
 
 // WebConfigYAML controls the task-board HTTP server. Enabled is opt-in;

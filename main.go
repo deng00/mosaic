@@ -37,6 +37,7 @@ import (
 	"syscall"
 
 	"github.com/deng00/mosaic/pkg/agent"
+	"github.com/deng00/mosaic/pkg/dispatch"
 	"github.com/deng00/mosaic/pkg/matrix"
 	"github.com/deng00/mosaic/pkg/task"
 	"github.com/deng00/mosaic/pkg/web"
@@ -74,6 +75,23 @@ func main() {
 				webSrv = s
 			}
 		}
+
+		// Auto-dispatch: tasks moved into in_progress fan out to an
+		// idle agent. APIBase / APIToken plumb the per-task callback
+		// env when the web server is up; left empty otherwise (the
+		// agent then has no programmatic way to flip state, and a
+		// human moves it via the board).
+		dCfg := dispatch.Config{
+			DataDir:              fc.DataDir,
+			DefaultWorkspaceRoot: filepath.Join(fc.DataDir, "workspaces"),
+		}
+		if webSrv != nil {
+			dCfg.APIBase = "http://" + webSrv.Addr()
+			dCfg.APIToken = webSrv.Token()
+		}
+		dispatcher := dispatch.New(dCfg, taskStore, newDispatchMemory(fc), newDispatchSink(runtime, fc))
+		dispatcher.Start()
+		log.Printf("[dispatch] enabled (workspaceRoot=%s, callbackAPI=%q)", dCfg.DefaultWorkspaceRoot, dCfg.APIBase)
 
 		for _, bc := range all {
 			wg.Add(1)
