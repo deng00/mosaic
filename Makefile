@@ -1,6 +1,6 @@
 # Pure-Go olm/megolm via build tag — no cgo, no libolm system dep.
 GO_TAGS := goolm
-BIN := mosaic
+BIN := mosaic-bin
 
 .PHONY: build run clean tidy testmsg readroom all
 
