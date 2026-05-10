@@ -304,7 +304,15 @@ func (b *Bridge) handleMessage(ctx context.Context, roomID id.RoomID, eventID id
 	// turn end-to-end before picking up the next.
 	sess := b.getOrCreate(context.Background(), roomID)
 	if sess == nil || sess.inbox == nil {
-		log.Printf("[agent] no session inbox for %s — message dropped", roomID)
+		// getOrCreate logged the actual spawn error; surface a
+		// chat-visible hint so the user isn't left wondering why
+		// the message vanished. Most likely cause: configured cwd
+		// doesn't exist on this host.
+		log.Printf("[agent] no session inbox for %s — claude spawn failed; replying error to user", roomID)
+		_, _ = b.mx.SendText(context.Background(), roomID,
+			"❌ 起 claude 子进程失败 —— 多半是配置的 cwd 在这台机器上不存在。"+
+				"用 `!project status` 看当前解析的 cwd，再 `!project set-cwd <有效路径>` 改正。"+
+				"详细错见 `~/.mosaic/agent.log`.")
 		return
 	}
 	select {
