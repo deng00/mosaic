@@ -93,10 +93,11 @@ func (c *FileConfig) AllAgents() []BotConfig {
 }
 
 type BotConfig struct {
+	// --- Matrix identity ---
 	ID       string `yaml:"id"`       // unique per-deployment, used as data subdir name
 	User     string `yaml:"user"`     // localpart (immutable; the Matrix account user_id)
 	Password string `yaml:"password"`
-	// DeviceName tells *which machine* this agent's claude subprocess
+	// DeviceName tells *which machine* this agent's runtime subprocess
 	// runs on. Visible in the user's "active sessions" page in Element
 	// (think "Cindy on danny's MacBook" vs "Cindy on the office Mac
 	// mini"). Defaults to os.Hostname() when empty — useful when the
@@ -107,24 +108,48 @@ type BotConfig struct {
 	// room members see in the member list and as message sender).
 	// Pushed to Matrix profile on every startup. Empty keeps whatever
 	// Matrix has stored.
-	DisplayName string       `yaml:"display_name,omitempty"`
-	Claude      ClaudeConfig `yaml:"claude"`
-
+	DisplayName string `yaml:"display_name,omitempty"`
 	// AutoJoinSpaceChildren: when true and the bot is a member of any
 	// Space, every newly added m.space.child triggers a JoinRoomByID
 	// for that child. Works for `restricted`-rule rooms (the bot is
 	// auto-authorised by Space membership). Private rooms still need
 	// an explicit invite. Default: false — opt in per bot.
 	AutoJoinSpaceChildren bool `yaml:"auto_join_space_children,omitempty"`
+
+	// --- Runtime selection + cross-runtime settings ---
+	// Runtime picks which coding-agent CLI to drive ("claude" / "codex").
+	// Empty defaults to "claude". See pkg/runtime/Registered() for
+	// the live list.
+	Runtime string `yaml:"runtime,omitempty"`
+	// Binary overrides the executable path; default per-driver
+	// ("claude" / "codex").
+	Binary string `yaml:"binary,omitempty"`
+	// Cwd is the fallback working directory when no project- or
+	// room-level override matches.
+	Cwd string `yaml:"cwd,omitempty"`
+	// Model maps to --model on the underlying CLI.
+	Model string `yaml:"model,omitempty"`
+	// Effort maps to claude's --effort flag (low / medium / high /
+	// xhigh / max). Other runtimes (codex) silently ignore.
+	Effort string `yaml:"effort,omitempty"`
+	// Env is extra KEY=VALUE pairs injected into every spawned
+	// runtime subprocess. Useful for CLAUDE_CODE_OAUTH_TOKEN etc.
+	Env map[string]string `yaml:"env,omitempty"`
+
+	// --- Runtime-specific sub-blocks ---
+	// Only the block matching Runtime is consulted; others are
+	// silently ignored (kept around so a user can switch Runtime
+	// without losing per-driver settings).
+	Claude ClaudeRuntimeConfig `yaml:"claude,omitempty"`
 }
 
-type ClaudeConfig struct {
-	Binary             string `yaml:"binary"`              // default "claude"
-	Cwd                string `yaml:"cwd"`                 // fallback cwd when no project / room override matches
-	Model              string `yaml:"model"`
-	PermissionMode     string `yaml:"permission_mode"`     // default "bypassPermissions"
-	AppendSystemPrompt string `yaml:"append_system_prompt,omitempty"`
-	Env                map[string]string `yaml:"env,omitempty"`
+// ClaudeRuntimeConfig holds settings that only the claude runtime
+// understands.
+type ClaudeRuntimeConfig struct {
+	// PermissionMode maps to claude's --permission-mode. Default
+	// "bypassPermissions" — applied by main.go at agent startup
+	// (not at config load) so it's visible in YAML when changed.
+	PermissionMode string `yaml:"permission_mode,omitempty"`
 }
 
 type ProjectConfigYAML struct {

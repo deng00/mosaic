@@ -14,7 +14,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -25,7 +24,7 @@ import (
 
 	"maunium.net/go/mautrix/id"
 
-	"github.com/deng00/mosaic/pkg/claude/streamjson"
+	"github.com/deng00/mosaic/pkg/runtime"
 	"github.com/deng00/mosaic/pkg/matrix"
 )
 
@@ -61,13 +60,20 @@ type resolution struct {
 }
 
 // Options configures the Bridge. Cwd defaults to the process cwd if
-// empty. Model is passed to claude --model.
+// empty. Model is passed to the coding agent (--model).
 type Options struct {
+	// Runtime selects the coding-agent driver ("claude", "codex").
+	// Empty defaults to "claude" via pkg/runtime.Get.
+	Runtime string
+
 	Cwd            string
 	Model          string
-	PermissionMode string // e.g. "bypassPermissions" for hands-off agents
+	// Effort maps to claude --effort (low / medium / high / xhigh / max).
+	// Codex ignores. Per-agent default; no per-project override layered today.
+	Effort         string
+	PermissionMode string // claude-only; e.g. "bypassPermissions"
 	FlushInterval  time.Duration
-	Binary         string // claude binary; default "claude"
+	Binary         string // override binary path; default per-driver
 
 	// Projects maps Space room ID → cwd/model defaults shared by all
 	// rooms inside that space. Optional.
@@ -122,6 +128,16 @@ type Bridge struct {
 	sessions       map[id.RoomID]*roomSession
 	resolutions    map[id.RoomID]resolution // cache of room → cwd/model/space
 	pendingCompact map[id.RoomID]bool       // rooms whose next-completed turn should be saved as SUMMARY.md
+	pendingAsks    map[id.RoomID]*pendingAsk // latest open ask_user prompt per room
+}
+
+// pendingAsk tracks an open <ask_user> question awaiting a number-emoji
+// reaction. eventID is the Matrix message the bot pre-seeded with
+// 1️⃣..N reactions; options[i] is the text injected as the next user
+// turn when the user picks emoji (i+1).
+type pendingAsk struct {
+	eventID id.EventID
+	options []string
 }
 
 func New(mx *matrix.Client, opts Options) *Bridge {
@@ -134,6 +150,7 @@ func New(mx *matrix.Client, opts Options) *Bridge {
 		sessions:       make(map[id.RoomID]*roomSession),
 		resolutions:    make(map[id.RoomID]resolution),
 		pendingCompact: make(map[id.RoomID]bool),
+		pendingAsks:    make(map[id.RoomID]*pendingAsk),
 	}
 }
 
@@ -326,6 +343,349 @@ func (b *Bridge) resolve(ctx context.Context, roomID id.RoomID) resolution {
 // Start wires the message handler. Call once before mx.Sync.
 func (b *Bridge) Start() {
 	b.mx.OnMessage(b.handleMessage)
+	b.mx.OnSpaceJoined(b.handleSpaceJoined)
+	b.mx.OnReaction(b.handleReaction)
+}
+
+// askUserProtocol is appended to every spawn's system prompt so the
+// model knows the exact envelope to emit when it wants the user to
+// pick from discrete options. The bridge parses these blocks out of
+// the final assistant text and renders an interactive Matrix
+// message with 1️⃣..N reactions; the user's emoji pick becomes the
+// next user turn verbatim.
+//
+// Constraints we enforce in the parser:
+//   - 2 ≤ option count ≤ 10
+//   - each option on its own bullet line ("- " or "* ")
+//   - question is everything else inside the block (typically one line)
+//
+// Malformed blocks are LEFT INLINE so the model can see in the next
+// turn's context that the format wasn't honored.
+const askUserProtocol = `## Mosaic protocol: ask_user
+
+When you need the user to pick from a small set of discrete options,
+output exactly this block (and nothing else around it that mimics it):
+
+` + "```" + `
+<ask_user>
+your question on one line
+- option 1 text
+- option 2 text
+- option 3 text
+</ask_user>
+` + "```" + `
+
+Rules:
+- 2 to 10 options. Fewer than 2 = it's not a multiple-choice question, just ask plainly.
+- Each option on its own bullet line ("- " or "* ").
+- Mosaic strips this block from the visible reply and renders the question
+  as a separate message with 1️⃣ 2️⃣ … reactions; the user's pick becomes
+  the next user turn verbatim.
+- Don't use this for yes/no — just ask in plain text.
+- Don't paste this block inside other text or code fences — it must be
+  at the top level of your reply.`
+
+// askUserNumberEmoji maps a 1-based index to the keycap-number emoji
+// Element renders as a button. Indexes outside 1–10 yield "" — the
+// caller should cap option counts at 10.
+func askUserNumberEmoji(i int) string {
+	switch i {
+	case 1:
+		return "1️⃣"
+	case 2:
+		return "2️⃣"
+	case 3:
+		return "3️⃣"
+	case 4:
+		return "4️⃣"
+	case 5:
+		return "5️⃣"
+	case 6:
+		return "6️⃣"
+	case 7:
+		return "7️⃣"
+	case 8:
+		return "8️⃣"
+	case 9:
+		return "9️⃣"
+	case 10:
+		return "🔟"
+	}
+	return ""
+}
+
+// indexFromAskEmoji is the inverse of askUserNumberEmoji. Returns 0
+// for unrelated emojis (the bridge ignores reactions outside the ask
+// keycap set so users can still 👍 / ❤️ messages without triggering
+// a turn injection).
+func indexFromAskEmoji(key string) int {
+	for i := 1; i <= 10; i++ {
+		if askUserNumberEmoji(i) == key {
+			return i
+		}
+	}
+	return 0
+}
+
+// askUser captures one parsed <ask_user> block.
+type askUser struct {
+	question string
+	options  []string
+}
+
+// extractAskUserBlocks pulls every <ask_user>...</ask_user> block out
+// of text and returns (cleaned text, parsed asks). Quiet on malformed
+// blocks (no closer / fewer than 2 options): the block is left inline
+// and no ask is parsed, so the model sees its own output in the next
+// turn's context as a hint that the protocol wasn't honored.
+//
+// Expected block format (1-indented list, dash bullets, ≤ 10 options):
+//
+//	<ask_user>
+//	question text on one line
+//	- option A
+//	- option B
+//	- option C
+//	</ask_user>
+func extractAskUserBlocks(text string) (string, []askUser) {
+	const open = "<ask_user>"
+	const close = "</ask_user>"
+	var (
+		asks  []askUser
+		out   strings.Builder
+		head  = 0
+	)
+	for {
+		i := strings.Index(text[head:], open)
+		if i < 0 {
+			out.WriteString(text[head:])
+			break
+		}
+		startBlock := head + i
+		j := strings.Index(text[startBlock:], close)
+		if j < 0 {
+			// Unterminated — give up parsing further blocks.
+			out.WriteString(text[head:])
+			break
+		}
+		endBlock := startBlock + j + len(close)
+		raw := text[startBlock+len(open) : startBlock+j]
+		if a, ok := parseAskBlock(raw); ok {
+			out.WriteString(text[head:startBlock])
+			asks = append(asks, a)
+		} else {
+			// Keep the malformed block visible so the user / next turn
+			// can see what went wrong.
+			out.WriteString(text[head:endBlock])
+		}
+		head = endBlock
+	}
+	cleaned := strings.TrimSpace(out.String())
+	return cleaned, asks
+}
+
+// parseAskBlock parses the inner body of an <ask_user> block. Returns
+// ok=false when the block has fewer than 2 options or no question
+// line — both signal "model didn't follow the format, leave it
+// inline."
+func parseAskBlock(raw string) (askUser, bool) {
+	var (
+		question string
+		options  []string
+	)
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Option lines: "- text" or "* text". Anything else is the
+		// question (only the first such line is kept; extras are
+		// folded into the question with spaces).
+		if strings.HasPrefix(line, "- ") || strings.HasPrefix(line, "* ") {
+			opt := strings.TrimSpace(line[2:])
+			if opt != "" {
+				options = append(options, opt)
+			}
+			continue
+		}
+		if question == "" {
+			question = line
+		} else {
+			question += " " + line
+		}
+	}
+	if question == "" || len(options) < 2 {
+		return askUser{}, false
+	}
+	if len(options) > 10 {
+		options = options[:10]
+	}
+	return askUser{question: question, options: options}, true
+}
+
+// renderAskUser posts the question + numbered options as one Matrix
+// message, pre-seeds 1️⃣..N reactions on it, and stores the room's
+// pendingAsk so handleReaction can resolve the user's pick.
+func (t *turn) renderAskUser(ctx context.Context, a askUser) {
+	var sb strings.Builder
+	sb.WriteString("❓ ")
+	sb.WriteString(a.question)
+	sb.WriteString("\n\n")
+	for i, opt := range a.options {
+		// Blank line between options — goldmark collapses single \n
+		// to a space (paragraph behavior), so a hard line break
+		// requires either two trailing spaces or a blank line. Blank
+		// line wins on portability.
+		fmt.Fprintf(&sb, "%s %s\n\n", askUserNumberEmoji(i+1), opt)
+	}
+	sb.WriteString("_点下面对应的数字 emoji 选一个。_")
+
+	evID, err := t.b.mx.SendText(ctx, t.roomID, sb.String())
+	if err != nil {
+		log.Printf("[agent] ask_user send failed: %v", err)
+		return
+	}
+	for i := range a.options {
+		key := askUserNumberEmoji(i + 1)
+		if err := t.b.mx.SendReaction(ctx, t.roomID, evID, key); err != nil {
+			log.Printf("[agent] ask_user pre-seed reaction %s failed: %v", key, err)
+		}
+	}
+	t.b.mu.Lock()
+	t.b.pendingAsks[t.roomID] = &pendingAsk{eventID: evID, options: a.options}
+	t.b.mu.Unlock()
+}
+
+// handleReaction is the m.reaction handler. We only act when the
+// reaction targets an open pendingAsk for the room AND the emoji
+// matches a 1️⃣..🔟 keycap. The first matching reaction wins; we
+// clear the pendingAsk so follow-on clicks don't kick a second turn.
+func (b *Bridge) handleReaction(ctx context.Context, roomID id.RoomID, sourceEventID id.EventID, sender id.UserID, key string) {
+	idx := indexFromAskEmoji(key)
+	if idx == 0 {
+		return
+	}
+	if !b.isAllowed(sender) {
+		return
+	}
+	b.mu.Lock()
+	pending, ok := b.pendingAsks[roomID]
+	if !ok || pending.eventID != sourceEventID {
+		b.mu.Unlock()
+		return
+	}
+	if idx < 1 || idx > len(pending.options) {
+		b.mu.Unlock()
+		return
+	}
+	chosen := pending.options[idx-1]
+	delete(b.pendingAsks, roomID)
+	b.mu.Unlock()
+	log.Printf("[agent] ask_user resolved in %s: %s → %q", roomID, key, truncate(chosen, 80))
+
+	// Acknowledge the choice visibly so the user sees what was picked
+	// (the reaction click itself is subtle), then enqueue as a turn.
+	_, _ = b.mx.SendText(ctx, roomID, fmt.Sprintf("> %s %s", key, chosen))
+
+	sess := b.getOrCreate(ctx, roomID)
+	if sess == nil || sess.inbox == nil {
+		log.Printf("[agent] ask_user could not enqueue (no inbox) in %s", roomID)
+		return
+	}
+	select {
+	case sess.inbox <- turnRequest{sender: sender, text: chosen}:
+	default:
+		log.Printf("[agent] ask_user inbox full in %s", roomID)
+	}
+}
+
+// handleSpaceJoined runs after the bot auto-joins a fresh sub-Space
+// (a child Space of an existing Space the bot is in). Auto-join has
+// no human "trigger" to invite to welcome — passes "" so the welcome
+// room exists as a Space child only, visible after the user joins
+// the Space in Element.
+func (b *Bridge) handleSpaceJoined(ctx context.Context, parentSpace, newSpace id.RoomID, spaceName string) {
+	b.handleSpaceJoinedWithInvite(ctx, parentSpace, newSpace, spaceName, "")
+}
+
+// handleSpaceJoinedWithInvite is the shared post-Space-join init.
+// Two idempotent side effects:
+//
+//  1. EnsureProject inserts a project entry keyed by the new Space's
+//     ID, defaulting the project name to the Space's m.room.name.
+//     Only the first agent to win the race gets created=true.
+//  2. The winning agent creates a "welcome" topic-room as a child of
+//     the new Space and posts a short bootstrap message. Other agents
+//     no-op so we don't end up with multiple welcome rooms.
+//
+// inviteUser is the human who should be pinged into the welcome room
+// directly (the /project new caller). Pass "" for the auto-join path
+// where there's no specific caller.
+//
+// Failures are logged and swallowed — auto-init is a convenience, not
+// a precondition for the Space being usable.
+func (b *Bridge) handleSpaceJoinedWithInvite(ctx context.Context, parentSpace, newSpace id.RoomID, spaceName string, inviteUser id.UserID) {
+	if b.opts.Manager == nil {
+		return
+	}
+	defaultName := spaceName
+	if defaultName == "" {
+		defaultName = FoldHomeServer(string(newSpace), b.opts.ServerName)
+	}
+	created, err := b.opts.Manager.EnsureProject(string(newSpace), defaultName)
+	if err != nil {
+		log.Printf("[agent] auto-init project for %s failed: %v", newSpace, err)
+		return
+	}
+	if !created {
+		// Another agent (or a prior run) already initialised this
+		// Space. Nothing to do — welcome room, if any, was their job.
+		return
+	}
+	log.Printf("[agent] auto-initialised project for sub-space %s (name=%q, parent=%s)",
+		newSpace, defaultName, parentSpace)
+
+	var invites []id.UserID
+	if inviteUser != "" && inviteUser != b.mx.UserID() {
+		invites = []id.UserID{inviteUser}
+	}
+
+	roomID, err := b.mx.CreateRoom(ctx, matrix.CreateRoomOpts{
+		Name:             "welcome",
+		Topic:            "🎉 " + defaultName + " — 起步房间",
+		ParentSpace:      newSpace,
+		Invite:           invites,
+		Preset:           "private_chat",
+		StrictParentLink: true,
+	})
+	if err != nil {
+		log.Printf("[agent] welcome room creation in space %s failed: %v", newSpace, err)
+		// Most common cause: bot lacks PL 50 in the new sub-Space, so
+		// linking m.space.child fails. Surface a hint in the parent
+		// Org Space (where the bot was originally invited and likely
+		// has higher PL — at least the user is watching it) so the
+		// user knows what to do next. Best-effort.
+		hint := fmt.Sprintf(
+			"⚠️ 在新 Space **%s** 里建 welcome room 失败：我在该 Space 没有足够权限"+
+				"（需要 Moderator / PL 50 才能挂 child room）。\n\n"+
+				"在 Element 里把我提为 Moderator，再重新创建一次该 Space 就会自动建 welcome room。",
+			defaultName)
+		if _, sendErr := b.mx.SendText(ctx, parentSpace, hint); sendErr != nil {
+			log.Printf("[agent] welcome failure hint send to %s failed: %v", parentSpace, sendErr)
+		}
+		return
+	}
+	greeting := fmt.Sprintf(
+		"👋 欢迎来到 **%s**！\n\n"+
+			"这个 room 由 mosaic 自动建好作为项目起步入口。常用动作：\n\n"+
+			"- `/project status` — 查当前 Space / cwd\n"+
+			"- `/project cwd <path>` — 设置工作目录（admin）\n"+
+			"- `/project name <name>` — 改项目名（admin）\n"+
+			"- 在 Space 下再开 topic room 即可分线协作\n",
+		defaultName)
+	if _, err := b.mx.SendText(ctx, roomID, greeting); err != nil {
+		log.Printf("[agent] welcome message send to %s failed: %v", roomID, err)
+	}
 }
 
 // roomSession is the per-room state: a long-lived claude process and
@@ -336,7 +696,7 @@ func (b *Bridge) Start() {
 // place and process FIFO.
 type roomSession struct {
 	mu     sync.Mutex
-	proc   *streamjson.Process
+	proc   runtime.Process
 	cancel context.CancelFunc
 	turns  int
 	roomID id.RoomID
@@ -348,12 +708,20 @@ type roomSession struct {
 }
 
 type turnRequest struct {
-	sender id.UserID
-	text   string
+	sender      id.UserID
+	text        string
+	attachments []matrix.Attachment
 }
 
-func (b *Bridge) handleMessage(ctx context.Context, roomID id.RoomID, eventID id.EventID, sender id.UserID, text string) {
-	log.Printf("[agent] %s in %s: %s", sender, roomID, truncate(text, 80))
+func (b *Bridge) handleMessage(ctx context.Context, im matrix.IncomingMessage) {
+	roomID := im.RoomID
+	sender := im.Sender
+	text := im.Text
+	if len(im.Attachments) > 0 {
+		log.Printf("[agent] %s in %s: %s (+%d attachment)", sender, roomID, truncate(text, 80), len(im.Attachments))
+	} else {
+		log.Printf("[agent] %s in %s: %s", sender, roomID, truncate(text, 80))
+	}
 
 	// /unarchive is the only thing honored when archived; everything
 	// else (claude turns, other slashes) gets bounced with a hint.
@@ -411,7 +779,7 @@ func (b *Bridge) handleMessage(ctx context.Context, roomID id.RoomID, eventID id
 		return
 	}
 	select {
-	case sess.inbox <- turnRequest{sender: sender, text: text}:
+	case sess.inbox <- turnRequest{sender: sender, text: text, attachments: im.Attachments}:
 	default:
 		// Buffer full → tell the user we're swamped rather than block
 		// the sync goroutine.
@@ -503,7 +871,7 @@ func (b *Bridge) handleSlash(roomID id.RoomID, sender id.UserID, text string) bo
 		b.pendingCompact[roomID] = true
 		b.mu.Unlock()
 		_, _ = b.mx.SendText(ctx, roomID, "🗜️ 正在生成会话摘要并归档（这一轮完成后会清空 LLM 上下文）...")
-		go b.runTurn(roomID, b.mx.UserID(), compactPrompt)
+		go b.runTurn(roomID, b.mx.UserID(), compactPrompt, nil)
 		return true
 	}
 	return false
@@ -808,6 +1176,20 @@ func (b *Bridge) handleProjectSlash(ctx context.Context, roomID id.RoomID, sende
 		}
 		return b.applyProjectMutation(ctx, roomID, rest, "", "")
 
+	case "new":
+		if !b.isAdmin(sender) {
+			_, _ = b.mx.SendText(ctx, roomID, "⛔ `/project new` 需要管理员权限")
+			return true
+		}
+		if rest == "" {
+			_, _ = b.mx.SendText(ctx, roomID,
+				"用法：`/project new <project-name>`\n\n"+
+					"机制：bot 直接建一个子 Space（bot 是 creator，PL 100），挂在当前所在的 Org Space 下，"+
+					"自动建 welcome room。在 Org Space 自身的 timeline 里发也行。")
+			return true
+		}
+		return b.handleProjectNew(ctx, roomID, sender, rest)
+
 	default:
 		_, _ = b.mx.SendText(ctx, roomID, "未知子命令 `"+subcmd+"`。试 `/project help`。")
 		return true
@@ -849,10 +1231,117 @@ func (b *Bridge) applyProjectMutation(ctx context.Context, roomID id.RoomID, nam
 	return true
 }
 
+// handleProjectNew creates a fresh sub-Space owned by the bot under the
+// current room's parent Org Space, then runs the standard space-joined
+// init flow (EnsureProject + welcome room). Doing it bot-side dodges
+// the PL-50 cliff that hits Element-created sub-Spaces: the bot is
+// the Space creator → PL 100 → all subsequent state ops succeed.
+//
+// Parent resolution walks the parent chain looking for the highest
+// Space the bot has PL ≥ 50 in. Rationale: the user typically
+// promotes the bot in the Org Space (top-level), not in every
+// intermediate Project Space, so picking the immediate parent often
+// fails the m.space.child link. Falls back to immediate parent if no
+// candidate has sufficient PL — the resulting orphan-from-org Space
+// is still usable, just not visible under the Org tree.
+func (b *Bridge) handleProjectNew(ctx context.Context, roomID id.RoomID, sender id.UserID, name string) bool {
+	parentSpace := b.resolveProjectParent(ctx, roomID)
+	if parentSpace == "" {
+		_, _ = b.mx.SendText(ctx, roomID,
+			"⚠️ 当前 room 不在任何 Space 下，无法决定要把新 project 挂到哪。"+
+				"在某个 Org Space 下的 room 里跑这条命令，或直接在 Org Space 的 timeline 里发。")
+		return true
+	}
+
+	newSpace, parentLinkErr, err := b.mx.CreateSpace(ctx, name, parentSpace, sender)
+	if err != nil {
+		_, _ = b.mx.SendText(ctx, roomID, "❌ 建 Space 失败："+err.Error())
+		return true
+	}
+	log.Printf("[agent] /project new created sub-space %s (name=%q, parent=%s, link_err=%v)",
+		newSpace, name, parentSpace, parentLinkErr)
+
+	// Reuse the auto-init path: EnsureProject + welcome room. Bot is
+	// PL 100 in newSpace so every state op inside succeeds. Forward
+	// `sender` as an extra invite so they get the welcome room ping
+	// even though their newSpace invite is still pending. If the
+	// async OnSpaceJoined later fires for the same Space, EnsureProject
+	// returns created=false and the side effects no-op.
+	b.handleSpaceJoinedWithInvite(ctx, parentSpace, newSpace, name, sender)
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "✅ 建好 project **%s**\n\n", name)
+	fmt.Fprintf(&sb, "- space: `%s`\n", FoldHomeServer(string(newSpace), b.opts.ServerName))
+	fmt.Fprintf(&sb, "- parent: `%s`\n", FoldHomeServer(string(parentSpace), b.opts.ServerName))
+	if parentLinkErr != nil {
+		fmt.Fprintf(&sb, "\n⚠️ 但没能挂到父 Space 下（我在父 Space 没 PL 50）：%v\n\n"+
+			"新 Space 现在是顶级独立 Space，你在 Element 的 rooms 列表能看到。"+
+			"如果想挂回 Org Space 下，把我在父 Space 里提到 Moderator，再手动 add child。",
+			parentLinkErr)
+	} else {
+		sb.WriteString("\n下面已自动建好 welcome room。")
+	}
+	_, _ = b.mx.SendText(ctx, roomID, sb.String())
+	return true
+}
+
+// resolveProjectParent picks the best Space to nest a new project
+// Space under, given the room the user ran /project new from. BFS
+// walks the inverted m.space.child graph (built from every Space the
+// bot is joined to) up to the topmost ancestor and prefers the
+// highest one the bot has PL ≥ 50 in.
+//
+// Why the inverse graph: most clients (Element specifically) only
+// publish m.space.child in parents, not m.space.parent in children.
+// Walking via ParentSpaces alone breaks at the first Element-added
+// nesting and never reaches the Org Space at the root.
+//
+// Falls back to the closest discovered ancestor on no PL match, and
+// to roomID itself when roomID is already a Space.
+func (b *Bridge) resolveProjectParent(ctx context.Context, roomID id.RoomID) id.RoomID {
+	if isSpace, _ := b.mx.IsSpace(ctx, roomID); isSpace {
+		return roomID
+	}
+	hierarchy, err := b.mx.SpaceHierarchy(ctx)
+	if err != nil {
+		log.Printf("[agent] resolveProjectParent: hierarchy scan failed: %v", err)
+		return ""
+	}
+	visited := map[id.RoomID]bool{roomID: true}
+	frontier := []id.RoomID{roomID}
+	var ancestors []id.RoomID
+	for len(frontier) > 0 {
+		var next []id.RoomID
+		for _, r := range frontier {
+			for _, p := range hierarchy[r] {
+				if visited[p] {
+					continue
+				}
+				visited[p] = true
+				ancestors = append(ancestors, p)
+				next = append(next, p)
+			}
+		}
+		frontier = next
+	}
+	if len(ancestors) == 0 {
+		return ""
+	}
+	// ancestors is BFS-ordered (closer first); iterate from the back
+	// to prefer the topmost Org Space when bot has PL there.
+	for i := len(ancestors) - 1; i >= 0; i-- {
+		if pl, err := b.mx.MyPowerLevel(ctx, ancestors[i]); err == nil && pl >= 50 {
+			return ancestors[i]
+		}
+	}
+	return ancestors[0]
+}
+
 const projectSlashHelp = `**` + "`/project`" + ` 命令家族**
 
 - ` + "`/project status`" + ` — 显示当前 room 的 Space / project / cwd 解析结果
 - ` + "`/project list`" + ` — 列出所有已配置 project
+- ` + "`/project new <name>`" + ` — bot 自己建子 Space + welcome room（绕过 PL 50 限制）⛔ admin only
 - ` + "`/project cwd <path>`" + ` — 给当前 room 所属 Space 设工作目录 ⛔ admin only
 - ` + "`/project name <name>`" + ` — 给当前 Space 起个人类可读的名字 ⛔ admin only
 - ` + "`/project help`" + ` — 这条帮助
@@ -1004,7 +1493,7 @@ func (b *Bridge) evictSession(roomID id.RoomID) {
 			close(s.inbox)
 		}
 		if s.proc != nil {
-			_ = s.proc.Close(0)
+			_ = s.proc.Close()
 		}
 		if s.cancel != nil {
 			s.cancel()
@@ -1012,8 +1501,8 @@ func (b *Bridge) evictSession(roomID id.RoomID) {
 	}
 }
 
-// endSession kills the running claude subprocess for this room (if
-// any) and forgets its session id so /resume won't bring it back.
+// endSession kills the running coding-agent subprocess for this room
+// (if any) and forgets its session id so /resume won't bring it back.
 // Closes the room's inbox so the dispatch loop can exit cleanly. The
 // next user message in the room will spawn a fresh session.
 func (b *Bridge) endSession(roomID id.RoomID) {
@@ -1028,7 +1517,7 @@ func (b *Bridge) endSession(roomID id.RoomID) {
 			close(s.inbox)
 		}
 		if s.proc != nil {
-			_ = s.proc.Close(2 * time.Second)
+			_ = s.proc.Close()
 		}
 		if s.cancel != nil {
 			s.cancel()
@@ -1046,14 +1535,33 @@ func or(a, fallback string) string {
 	return a
 }
 
-func (b *Bridge) runTurn(roomID id.RoomID, sender id.UserID, text string) {
+// toRuntimeAttachments converts matrix.Attachment values to the
+// runtime package's shape, dropping the matrix package import from
+// every driver. nil-in/nil-out.
+func toRuntimeAttachments(in []matrix.Attachment) []runtime.Attachment {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]runtime.Attachment, 0, len(in))
+	for _, a := range in {
+		out = append(out, runtime.Attachment{
+			Path:     a.Path,
+			MimeType: a.MimeType,
+			Kind:     a.Kind,
+			Filename: a.Filename,
+		})
+	}
+	return out
+}
+
+func (b *Bridge) runTurn(roomID id.RoomID, sender id.UserID, text string, attachments []matrix.Attachment) {
 	ctx := context.Background()
 	log.Printf("[agent] runTurn start in %s", roomID)
 
 	sess := b.getOrCreate(ctx, roomID)
 	if sess == nil || sess.proc == nil {
-		log.Printf("[agent] no claude proc available for %s — aborting turn", roomID)
-		_, _ = b.mx.SendText(ctx, roomID, "❌ failed to start claude (see agent logs)")
+		log.Printf("[agent] no agent proc available for %s — aborting turn", roomID)
+		_, _ = b.mx.SendText(ctx, roomID, "❌ failed to start agent (see agent logs)")
 		return
 	}
 	sess.mu.Lock()
@@ -1061,29 +1569,30 @@ func (b *Bridge) runTurn(roomID id.RoomID, sender id.UserID, text string) {
 	turnIdx := sess.turns
 	sess.mu.Unlock()
 
-	log.Printf("[agent] sending text into claude stdin (turn %d, %d bytes)", turnIdx, len(text))
-	if err := sess.proc.Send(streamjson.NewTextMessage(text)); err != nil {
+	rmsg := runtime.Message{Text: text, Attachments: toRuntimeAttachments(attachments)}
+	log.Printf("[agent] sending message to agent (turn %d, %d bytes, %d att)", turnIdx, len(text), len(rmsg.Attachments))
+	if err := sess.proc.Send(rmsg); err != nil {
 		// Most common: claude died between turns and stdin pipe is
 		// closed ("write |1: file already closed"). Evict the dead
 		// session and respawn — the new session will --resume the
-		// same claude session_id, preserving conversation memory.
+		// same session_id, preserving conversation memory.
 		log.Printf("[agent] proc.Send failed: %v — evicting + respawning", err)
 		b.evictSession(roomID)
 		sess = b.getOrCreate(ctx, roomID)
 		if sess == nil || sess.proc == nil {
-			_, _ = b.mx.SendText(ctx, roomID, "❌ claude 重启失败（见 agent log），请稍后重试")
+			_, _ = b.mx.SendText(ctx, roomID, "❌ agent 重启失败（见 agent log），请稍后重试")
 			return
 		}
 		sess.mu.Lock()
 		sess.turns++
 		turnIdx = sess.turns
 		sess.mu.Unlock()
-		if err2 := sess.proc.Send(streamjson.NewTextMessage(text)); err2 != nil {
+		if err2 := sess.proc.Send(rmsg); err2 != nil {
 			log.Printf("[agent] retry Send still failed: %v", err2)
-			_, _ = b.mx.SendText(ctx, roomID, "❌ claude 仍无法接收消息："+err2.Error())
+			_, _ = b.mx.SendText(ctx, roomID, "❌ agent 仍无法接收消息："+err2.Error())
 			return
 		}
-		log.Printf("[agent] respawned claude session, retry sent (turn %d)", turnIdx)
+		log.Printf("[agent] respawned agent session, retry sent (turn %d)", turnIdx)
 	}
 
 	// One Matrix message per claude content block. Text blocks are
@@ -1103,14 +1612,14 @@ func (b *Bridge) runTurn(roomID id.RoomID, sender id.UserID, text string) {
 		select {
 		case <-flush.C:
 			t.flushPendingText(ctx)
-		case raw, ok := <-sess.proc.Events():
+		case ev, ok := <-sess.proc.Events():
 			if !ok {
-				log.Printf("[agent] turn %d in %s: claude EOF — evicting session", turnIdx, roomID)
+				log.Printf("[agent] turn %d in %s: agent EOF — evicting session", turnIdx, roomID)
 				b.evictSession(roomID)
-				_, _ = b.mx.SendText(ctx, roomID, "❌ claude 进程退出（已清理本会话状态，下条消息将自动 resume 重启）")
+				_, _ = b.mx.SendText(ctx, roomID, "❌ agent 进程退出（已清理本会话状态，下条消息将自动 resume 重启）")
 				return
 			}
-			done := t.consume(ctx, raw)
+			done := t.consume(ctx, ev)
 			if done {
 				t.flushPendingText(ctx)
 				log.Printf("[agent] turn %d in %s: done (final-text=%dB, tool_msgs=%d)",
@@ -1170,7 +1679,8 @@ type turn struct {
 	// so SessionStore can persist it after the turn ends.
 	lastSessionID string
 
-	typing bool
+	typing       bool
+	lastTypingAt time.Time
 }
 
 func newTurn(b *Bridge, roomID id.RoomID) *turn {
@@ -1187,6 +1697,25 @@ func (t *turn) cleanup() {
 func (t *turn) startTyping(ctx context.Context) {
 	if err := t.b.mx.Typing(ctx, t.roomID, true, 30000); err == nil {
 		t.typing = true
+		t.lastTypingAt = time.Now()
+	}
+}
+
+// refreshTypingIfStale re-emits the typing notification when the last
+// one is close to the 30s server-side expiry. Called inline before
+// each outbound message so long turns (multi-tool, slow LLM) keep the
+// "is typing…" indicator alive without a background goroutine. The
+// 25s threshold leaves 5s of headroom for the EDU to actually land
+// at the homeserver before the previous one lapses.
+func (t *turn) refreshTypingIfStale(ctx context.Context) {
+	if !t.typing {
+		return
+	}
+	if time.Since(t.lastTypingAt) < 25*time.Second {
+		return
+	}
+	if err := t.b.mx.Typing(ctx, t.roomID, true, 30000); err == nil {
+		t.lastTypingAt = time.Now()
 	}
 }
 
@@ -1198,6 +1727,7 @@ func (t *turn) flushPendingText(ctx context.Context) {
 		return
 	}
 	t.lastFlushed = body
+	t.refreshTypingIfStale(ctx)
 	if t.textEvent == "" {
 		evID, err := t.b.mx.SendText(ctx, t.roomID, body)
 		if err != nil {
@@ -1230,149 +1760,107 @@ func (t *turn) finalizeText(ctx context.Context, canonical string) {
 	t.lastFlushed = ""
 }
 
-// consume one stream-json event. Returns done=true on `result`.
-func (t *turn) consume(ctx context.Context, raw json.RawMessage) bool {
-	var head struct {
-		Type    string `json:"type"`
-		Subtype string `json:"subtype"`
-	}
-	if err := json.Unmarshal(raw, &head); err != nil {
+// consume one normalized runtime.Event. Returns done=true on
+// TurnDone (end of turn). Side effects: sends/edits Matrix messages,
+// updates t.lastFinalText / t.lastSessionID / t.toolCount.
+func (t *turn) consume(ctx context.Context, ev runtime.Event) bool {
+	switch e := ev.(type) {
+	case runtime.TextDelta:
+		t.pending.WriteString(e.Text)
 		return false
-	}
 
-	switch head.Type {
-	case "stream_event":
-		// Partial text delta; lazy-create the streaming text msg.
-		var ev struct {
-			Event struct {
-				Type  string `json:"type"`
-				Delta struct {
-					Type string `json:"type"`
-					Text string `json:"text"`
-				} `json:"delta"`
-			} `json:"event"`
+	case runtime.TextFinal:
+		// Extract any ask_user protocol block before finalizing — the
+		// raw <ask_user> envelope is bridge plumbing and shouldn't
+		// reach the user. Two paths:
+		//   - Some prose remains around the envelope → finalize with
+		//     the cleaned body (Element edits the streamed bubble).
+		//   - The reply was nothing but the envelope → redact the
+		//     streamed bubble so only the rendered question card
+		//     stays visible. finalizeText("") can't help here: it's
+		//     guarded against blank canonical, and even if we passed
+		//     a single space the empty bubble is uglier than a clean
+		//     redact.
+		body, asks := extractAskUserBlocks(e.Body)
+		if len(asks) > 0 && strings.TrimSpace(body) == "" && t.textEvent != "" {
+			if err := t.b.mx.Redact(ctx, t.roomID, t.textEvent, "ask_user envelope"); err != nil {
+				log.Printf("[agent] redact ask-only streamed bubble failed: %v", err)
+				// Fallback: edit to a single space so the raw block at
+				// least doesn't shout. Element renders this as a thin
+				// empty bubble — strictly less bad than leaving the
+				// envelope inline.
+				_ = t.b.mx.EditText(ctx, t.roomID, t.textEvent, " ")
+			}
+			t.textEvent = ""
+			t.pending.Reset()
+			t.lastFlushed = ""
+			t.lastFinalText = ""
+		} else {
+			t.finalizeText(ctx, body)
 		}
-		if err := json.Unmarshal(raw, &ev); err != nil {
+		for _, ask := range asks {
+			t.renderAskUser(ctx, ask)
+		}
+		return false
+
+	case runtime.Thinking:
+		return false
+
+	case runtime.ToolUse:
+		// Close any in-flight streaming text first so timeline order
+		// is preserved.
+		t.finalizeText(ctx, "")
+		body := FormatToolUse(e.Name, e.Input)
+		t.refreshTypingIfStale(ctx)
+		if _, err := t.b.mx.SendText(ctx, t.roomID, body); err != nil {
+			log.Printf("[agent] send tool_use msg failed: %v", err)
+		}
+		t.toolCount++
+		return false
+
+	case runtime.ToolResult:
+		if !e.IsError {
 			return false
 		}
-		if ev.Event.Type == "content_block_delta" && ev.Event.Delta.Type == "text_delta" {
-			t.pending.WriteString(ev.Event.Delta.Text)
+		name := e.ToolName
+		if name == "" {
+			name = "tool"
+		}
+		body := FormatToolResult(name, e.Content, true)
+		if body != "" {
+			_, _ = t.b.mx.SendText(ctx, t.roomID, body)
 		}
 		return false
 
-	case "assistant":
-		// One full assistant message — walk its blocks in order.
-		var ev struct {
-			Message struct {
-				Content []struct {
-					Type  string          `json:"type"`
-					Text  string          `json:"text"`
-					Name  string          `json:"name"`
-					ID    string          `json:"id"`
-					Input json.RawMessage `json:"input"`
-				} `json:"content"`
-			} `json:"message"`
-		}
-		if err := json.Unmarshal(raw, &ev); err != nil {
-			return false
-		}
-		for _, blk := range ev.Message.Content {
-			switch blk.Type {
-			case "text":
-				// finalize any in-progress text msg with the canonical
-				// text from this block (deltas should match it but be
-				// authoritative)
-				t.finalizeText(ctx, blk.Text)
-			case "thinking":
-				// Surface as a quiet italic line in its own message.
-				t.finalizeText(ctx, "")
-				_, _ = t.b.mx.SendText(ctx, t.roomID, "_💭 "+truncate(oneLineCondensed(blk.Text), 600)+"_")
-			case "tool_use":
-				// Whatever text was streaming, close it before the
-				// tool message so timeline order is preserved.
-				t.finalizeText(ctx, "")
-				body := FormatToolUse(blk.Name, blk.Input)
-				if _, err := t.b.mx.SendText(ctx, t.roomID, body); err != nil {
-					log.Printf("[agent] send tool_use msg failed: %v", err)
-				}
-				t.toolCount++
-			}
-		}
+	case runtime.SessionInfo:
+		t.lastSessionID = e.SessionID
 		return false
 
-	case "user":
-		// tool_result blocks. Most are silent; surface only errors.
-		var ev struct {
-			Message struct {
-				Content json.RawMessage `json:"content"`
-			} `json:"message"`
-		}
-		if err := json.Unmarshal(raw, &ev); err != nil {
-			return false
-		}
-		var blocks []struct {
-			Type      string          `json:"type"`
-			ToolUseID string          `json:"tool_use_id"`
-			Content   json.RawMessage `json:"content"`
-			IsError   bool            `json:"is_error"`
-		}
-		if err := json.Unmarshal(ev.Message.Content, &blocks); err != nil {
-			return false
-		}
-		for _, blk := range blocks {
-			if blk.Type != "tool_result" || !blk.IsError {
-				continue
-			}
-			// We don't know the tool name from this event; surface a
-			// generic error block with the content so the user knows
-			// something went wrong.
-			body := FormatToolResult("tool", blk.Content, true)
-			if body != "" {
-				_, _ = t.b.mx.SendText(ctx, t.roomID, body)
-			}
-		}
-		return false
-
-	case "system":
-		if head.Subtype == "init" {
-			var ev struct {
-				SessionID string `json:"session_id"`
-			}
-			if err := json.Unmarshal(raw, &ev); err == nil {
-				t.lastSessionID = ev.SessionID
-			}
-		}
-		return false
-
-	case "result":
-		// End of turn. Translate claude's terse error subtypes into
-		// something a chat user can act on.
-		var ev struct {
-			Subtype string `json:"subtype"`
-		}
-		_ = json.Unmarshal(raw, &ev)
-		if strings.HasPrefix(ev.Subtype, "error") {
-			_, _ = t.b.mx.SendText(ctx, t.roomID, formatResultError(ev.Subtype))
+	case runtime.TurnDone:
+		if e.Err != "" || e.Reason != "" {
+			_, _ = t.b.mx.SendText(ctx, t.roomID, formatTurnError(e))
 		}
 		return true
 	}
 	return false
 }
 
-// formatResultError renders claude's `result.subtype=error_*` into a
-// chat-friendly message. We don't auto-retry — claude's errors can be
-// systematic (rate limit, exhausted tools), and a retry loop in the
-// agent could spin up cost / make things worse.
-func formatResultError(subtype string) string {
-	switch subtype {
-	case "error_during_execution":
-		return "❌ Claude 执行中出错（多半是工具调用失败 / API 限流 / 网络抖动）。重发上一条消息可重试；若反复出现请检查 `~/.mosaic/agent.log`。"
-	case "error_max_turns":
-		return "❌ 触达 turn 上限。Claude 一次会话内的工具调用回合数有限，可能任务过于复杂。建议 `/compact` 总结后重起。"
-	case "error_max_tokens":
-		return "❌ 输出 token 上限。这一轮太长了——可让 Claude 分步输出，或调小请求范围。"
+// formatTurnError renders a TurnDone failure into a chat-friendly
+// message. We don't auto-retry — these errors can be systematic
+// (rate limit, exhausted tools) and a retry loop could burn cost.
+func formatTurnError(td runtime.TurnDone) string {
+	switch td.Reason {
+	case "max_turns":
+		return "❌ 触达 turn 上限。一次会话内的工具调用回合数有限，可能任务过于复杂。建议 `/compact` 总结后重起。"
+	case "max_tokens":
+		return "❌ 输出 token 上限。这一轮太长了——可让 agent 分步输出，或调小请求范围。"
+	case "rate_limit":
+		return "❌ 上游限流。稍后重发。"
 	default:
-		return "❌ Claude error: " + subtype + "（未识别的错误码）"
+		if td.Err != "" {
+			return "❌ agent 执行出错：" + td.Err
+		}
+		return "❌ agent 未知错误"
 	}
 }
 
@@ -1413,11 +1901,29 @@ func (b *Bridge) getOrCreate(ctx context.Context, roomID id.RoomID) *roomSession
 		// re-injecting an outdated SUMMARY.md would confuse it.
 		appendSP = b.opts.Memory.SystemPrompt(r.SpaceID, roomID)
 	}
+	// askUserProtocol is always appended (including on resume) so the
+	// runtime always knows the convention even after long-running
+	// sessions where the original directive may have aged out.
+	if appendSP != "" {
+		appendSP += "\n\n"
+	}
+	appendSP += askUserProtocol
 	mergedEnv := mergeEnv(b.opts.Env, r.Env)
-	log.Printf("[agent] spawning claude (cwd=%s model=%q resume=%q sysPromptLen=%d envKeys=%d)", cwd, model, resume, len(appendSP), len(mergedEnv))
-	proc, err := streamjson.Spawn(procCtx, streamjson.Options{
+	rt := b.opts.Runtime
+	if rt == "" {
+		rt = "claude"
+	}
+	drv, err := runtime.Get(rt)
+	if err != nil {
+		cancel()
+		log.Printf("[agent] get runtime driver failed: %v", err)
+		return &roomSession{cancel: cancel}
+	}
+	log.Printf("[agent] spawning %s (cwd=%s model=%q effort=%q resume=%q sysPromptLen=%d envKeys=%d)", rt, cwd, model, b.opts.Effort, resume, len(appendSP), len(mergedEnv))
+	proc, err := drv.Spawn(procCtx, runtime.Options{
 		Cwd:                cwd,
 		Model:              model,
+		Effort:             b.opts.Effort,
 		PermissionMode:     b.opts.PermissionMode,
 		Binary:             b.opts.Binary,
 		Resume:             resume,
@@ -1426,7 +1932,7 @@ func (b *Bridge) getOrCreate(ctx context.Context, roomID id.RoomID) *roomSession
 	})
 	if err != nil {
 		cancel()
-		log.Printf("[agent] spawn claude failed: %v", err)
+		log.Printf("[agent] spawn %s failed: %v", rt, err)
 		return &roomSession{cancel: cancel}
 	}
 	scope := "no-project"
@@ -1436,9 +1942,9 @@ func (b *Bridge) getOrCreate(ctx context.Context, roomID id.RoomID) *roomSession
 		scope = "space=" + string(r.SpaceID)
 	}
 	if resume != "" {
-		log.Printf("[agent] resumed claude session %s for room %s (cwd=%s, %s)", resume, roomID, cwd, scope)
+		log.Printf("[agent] resumed %s session %s for room %s (cwd=%s, %s)", rt, resume, roomID, cwd, scope)
 	} else {
-		log.Printf("[agent] spawned fresh claude session for room %s (cwd=%s, %s)", roomID, cwd, scope)
+		log.Printf("[agent] spawned fresh %s session for room %s (cwd=%s, %s)", rt, roomID, cwd, scope)
 	}
 
 	// Re-acquire the lock to register the session, racing-aware: if
@@ -1448,7 +1954,7 @@ func (b *Bridge) getOrCreate(ctx context.Context, roomID id.RoomID) *roomSession
 	if existing, ok := b.sessions[roomID]; ok {
 		b.mu.Unlock()
 		log.Printf("[agent] race: another goroutine spawned for %s; closing duplicate", roomID)
-		_ = proc.Close(0)
+		_ = proc.Close()
 		cancel()
 		return existing
 	}
@@ -1478,7 +1984,7 @@ func (b *Bridge) getOrCreate(ctx context.Context, roomID id.RoomID) *roomSession
 // when the session is removed (e.g. /new-session, /compact).
 func (b *Bridge) dispatchLoop(s *roomSession) {
 	for req := range s.inbox {
-		b.runTurn(s.roomID, req.sender, req.text)
+		b.runTurn(s.roomID, req.sender, req.text, req.attachments)
 		// Note: if /new-session or /compact ran during the turn, the
 		// session was removed from b.sessions but THIS goroutine
 		// keeps draining its old inbox (now orphaned). The next

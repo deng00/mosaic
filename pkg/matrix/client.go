@@ -14,6 +14,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -78,11 +81,48 @@ func looksMarkdown(s string) bool {
 	return false
 }
 
-// MessageHandler is invoked for every inbound text message in any room
-// the bot is in, except messages sent by the bot itself. The handler
-// runs in the sync goroutine; long work should be punted to its own
+// Attachment is one inbound media file that the matrix client has
+// already downloaded (and, for E2E rooms, decrypted) to local disk.
+// Path is an absolute filesystem path the bridge can hand directly to
+// a coding-agent runtime.
+type Attachment struct {
+	Path     string // absolute local path
+	MimeType string // e.g. "image/png"
+	Kind     string // "image" / "file" / "video" / "audio"
+	Filename string // original filename from the event (best-effort)
+}
+
+// IncomingMessage bundles a user message + any attachments. Text may
+// be empty for media-only messages (Element typically sets Body to
+// the filename for media events — we surface that as Text so the
+// agent at least sees the caption).
+type IncomingMessage struct {
+	RoomID      id.RoomID
+	EventID     id.EventID
+	Sender      id.UserID
+	Text        string
+	Attachments []Attachment
+}
+
+// MessageHandler is invoked for every inbound user message (text or
+// media) in any room the bot is in, except echoes of its own sends.
+// Runs in the sync goroutine; long work should be punted to its own
 // goroutine.
-type MessageHandler func(ctx context.Context, roomID id.RoomID, eventID id.EventID, sender id.UserID, text string)
+type MessageHandler func(ctx context.Context, msg IncomingMessage)
+
+// SpaceJoinedHandler is invoked after the bot successfully auto-joins
+// an m.space.child whose target room is itself a Matrix Space (i.e. a
+// "sub-Space" used as a project). parentSpace is the existing Space
+// that announced the new child; newSpace is the freshly joined Space.
+// spaceName is the new Space's m.room.name (may be empty if the user
+// hasn't named it yet). Runs in the sync goroutine — punt long work.
+type SpaceJoinedHandler func(ctx context.Context, parentSpace, newSpace id.RoomID, spaceName string)
+
+// ReactionHandler fires for every inbound m.reaction not sent by the
+// bot. sourceEventID is the message the reaction is attached to;
+// key is the emoji (e.g. "1️⃣" or "👍"). Used by the bridge to wire
+// quick-reply buttons (ask_user → number-emoji reactions).
+type ReactionHandler func(ctx context.Context, roomID id.RoomID, sourceEventID id.EventID, sender id.UserID, key string)
 
 // Config bundles everything Login needs.
 type Config struct {
@@ -102,6 +142,13 @@ type Config struct {
 	// attempts to JoinRoomByID for every new m.space.child state event
 	// the bot observes in Spaces it belongs to. See BotConfig docs.
 	AutoJoinSpaceChildren bool
+
+	// MediaDir is where inbound attachments land after download +
+	// E2E decrypt. One file per inbound media event, named
+	// "<eventID>_<sanitized-filename>.<ext>". Empty disables image
+	// support (events are dropped at the syncer). The bridge sets
+	// this to data/agents/<id>/attachments/ at startup.
+	MediaDir string
 }
 
 // Client is the high-level wrapper. Construct via Login.
@@ -110,9 +157,12 @@ type Client struct {
 	helper *cryptohelper.CryptoHelper
 
 	autoJoinSpaceChildren bool
+	mediaDir              string
 
-	mu      sync.Mutex
-	handler MessageHandler
+	mu          sync.Mutex
+	handler     MessageHandler
+	spaceJoined SpaceJoinedHandler
+	reaction    ReactionHandler
 }
 
 // Login logs in (creating a new device if needed), starts the crypto
@@ -151,7 +201,7 @@ func Login(ctx context.Context, cfg Config) (*Client, error) {
 	}
 	mx.Crypto = helper
 
-	c := &Client{mx: mx, helper: helper, autoJoinSpaceChildren: cfg.AutoJoinSpaceChildren}
+	c := &Client{mx: mx, helper: helper, autoJoinSpaceChildren: cfg.AutoJoinSpaceChildren, mediaDir: cfg.MediaDir}
 	if err := c.bootstrapCrossSigning(ctx, cfg.Password); err != nil {
 		// Non-fatal: bot still works, just shows up as "unverified" in
 		// other clients. Worth logging loudly so the operator notices.
@@ -206,6 +256,76 @@ func (c *Client) OnMessage(h MessageHandler) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.handler = h
+}
+
+// OnSpaceJoined registers a handler invoked after the bot auto-joins a
+// child Space (m.space.child whose target is itself a Space). Used to
+// auto-initialise per-project state when a new sub-Space appears under
+// a Space the bot is in. Requires AutoJoinSpaceChildren=true.
+func (c *Client) OnSpaceJoined(h SpaceJoinedHandler) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.spaceJoined = h
+}
+
+// OnReaction registers the inbound reaction handler. Must be called
+// before Sync. The bot's own reactions (added programmatically to its
+// quick-reply messages) are filtered out before reaching h.
+func (c *Client) OnReaction(h ReactionHandler) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reaction = h
+}
+
+// Redact deletes a message event from the room timeline. Used by
+// the bridge to clean up the "raw streamed text" bubble when the
+// model's reply was nothing but an <ask_user> envelope — the
+// rendered button card is sent as a fresh message and the
+// envelope shouldn't linger above it. Per Matrix spec a user can
+// always redact their own events, so this works even when the bot
+// has PL 0 in the room.
+func (c *Client) Redact(ctx context.Context, roomID id.RoomID, eventID id.EventID, reason string) error {
+	_, err := c.mx.RedactEvent(ctx, roomID, eventID, mautrix.ReqRedact{Reason: reason})
+	return err
+}
+
+// SendReaction posts an m.reaction event from the bot, annotating
+// sourceEventID with key (an emoji string). Used by the bridge to
+// pre-seed quick-reply buttons (1️⃣ 2️⃣ …) on the bot's own
+// "ask_user" message.
+func (c *Client) SendReaction(ctx context.Context, roomID id.RoomID, sourceEventID id.EventID, key string) error {
+	content := event.ReactionEventContent{
+		RelatesTo: event.RelatesTo{
+			Type:    event.RelAnnotation,
+			EventID: sourceEventID,
+			Key:     key,
+		},
+	}
+	_, err := c.mx.SendMessageEvent(ctx, roomID, event.EventReaction, content)
+	return err
+}
+
+// IsSpace reports whether roomID is a Matrix Space — its m.room.create
+// state event has type = "m.space" (RoomTypeSpace). False on read
+// error, which is intentional: callers treat unknowns as plain rooms.
+func (c *Client) IsSpace(ctx context.Context, roomID id.RoomID) (bool, error) {
+	var content event.CreateEventContent
+	if err := c.mx.StateEvent(ctx, roomID, event.StateCreate, "", &content); err != nil {
+		return false, err
+	}
+	return content.Type == event.RoomTypeSpace, nil
+}
+
+// RoomName reads the m.room.name state event for roomID. Returns ""
+// (no error) when the room has no name set — that's the common case
+// for freshly-created rooms before the user types one.
+func (c *Client) RoomName(ctx context.Context, roomID id.RoomID) (string, error) {
+	var content event.RoomNameEventContent
+	if err := c.mx.StateEvent(ctx, roomID, event.StateRoomName, "", &content); err != nil {
+		// 404 (M_NOT_FOUND) → no name set; surface as empty.
+		return "", nil
+	}
+	return content.Name, nil
 }
 
 // UserID returns the bot's full Matrix ID (@bot:domain).
@@ -297,6 +417,20 @@ func (c *Client) HasJoinedRoom(ctx context.Context, roomID id.RoomID) bool {
 	return ok
 }
 
+// MyPowerLevel reports the bot's PL in roomID by reading m.room.power_levels.
+// Returns the per-user value if listed; otherwise users_default; 0 on error
+// (treat unknown as no privilege — callers gate behaviour on >= 50).
+func (c *Client) MyPowerLevel(ctx context.Context, roomID id.RoomID) (int, error) {
+	var pl event.PowerLevelsEventContent
+	if err := c.mx.StateEvent(ctx, roomID, event.StatePowerLevels, "", &pl); err != nil {
+		return 0, err
+	}
+	if v, ok := pl.Users[c.mx.UserID]; ok {
+		return v, nil
+	}
+	return pl.UsersDefault, nil
+}
+
 // CreateRoomOpts configures a per-task topic-room creation.
 type CreateRoomOpts struct {
 	Name        string      // visible name in Element
@@ -304,6 +438,15 @@ type CreateRoomOpts struct {
 	ParentSpace id.RoomID   // optional Space to attach as a child
 	Invite      []id.UserID // users to invite
 	Preset      string      // e.g. "private_chat" or "trusted_private_chat" (default: "private_chat")
+
+	// StrictParentLink — when true and ParentSpace is set, a failure to
+	// publish m.space.child in the parent (typically: bot lacks PL 50)
+	// is fatal: CreateRoom leaves the just-created orphan room and
+	// returns an error so callers don't accumulate invisible rooms.
+	// Default false preserves the legacy "best-effort" semantics for
+	// existing callers (e.g. the dispatcher) where an unlinked room
+	// is still usable.
+	StrictParentLink bool
 }
 
 // CreateRoom creates a new Matrix room owned by this client. When
@@ -334,6 +477,15 @@ func (c *Client) CreateRoom(ctx context.Context, opts CreateRoomOpts) (id.RoomID
 		if _, err := c.mx.SendStateEvent(ctx, opts.ParentSpace, event.StateSpaceChild, string(roomID),
 			&event.SpaceChildEventContent{Via: []string{via}}); err != nil {
 			log.Printf("[matrix] m.space.child failed (room created OK): %v", err)
+			if opts.StrictParentLink {
+				// Clean up the orphan so we don't leave invisible
+				// rooms in the bot's joined-set. Best-effort —
+				// LeaveRoom failure here is rare and not actionable.
+				if _, leaveErr := c.mx.LeaveRoom(ctx, roomID); leaveErr != nil {
+					log.Printf("[matrix] orphan cleanup leave %s failed: %v", roomID, leaveErr)
+				}
+				return "", fmt.Errorf("matrix: link child to parent space %s: %w", opts.ParentSpace, err)
+			}
 		}
 		if _, err := c.mx.SendStateEvent(ctx, roomID, event.StateSpaceParent, string(opts.ParentSpace),
 			&event.SpaceParentEventContent{Via: []string{via}, Canonical: true}); err != nil {
@@ -341,6 +493,58 @@ func (c *Client) CreateRoom(ctx context.Context, opts CreateRoomOpts) (id.RoomID
 		}
 	}
 	return roomID, nil
+}
+
+// CreateSpace creates a new Matrix Space owned by this client. Mosaic
+// uses this for `/project new`: the bot is the creator (PL 100) so it
+// can immediately set state events, link child rooms, etc. — the
+// user-typed-in-Element flow always leaves the bot at PL 0 and forces
+// a manual promotion.
+//
+// inviteUser, when non-empty, is invited and granted PL 100 as a
+// joint owner. Pass "" to skip.
+//
+// parentSpace, when non-empty, is best-effort linked: m.space.child
+// in parent (needs PL ≥ 50 in parent — surfaced via parentLinkErr if
+// it fails) and m.space.parent in the new Space (bot is creator so
+// this succeeds barring transient errors). The new Space is returned
+// regardless of parent-link success.
+func (c *Client) CreateSpace(ctx context.Context, name string, parentSpace id.RoomID, inviteUser id.UserID) (newSpace id.RoomID, parentLinkErr error, err error) {
+	plUsers := map[id.UserID]int{c.mx.UserID: 100}
+	var invites []id.UserID
+	if inviteUser != "" && inviteUser != c.mx.UserID {
+		invites = []id.UserID{inviteUser}
+		plUsers[inviteUser] = 100
+	}
+	req := &mautrix.ReqCreateRoom{
+		Name:   name,
+		Invite: invites,
+		Preset: "private_chat",
+		CreationContent: map[string]interface{}{
+			"type": string(event.RoomTypeSpace),
+		},
+		PowerLevelOverride: &event.PowerLevelsEventContent{
+			Users: plUsers,
+		},
+	}
+	resp, err := c.mx.CreateRoom(ctx, req)
+	if err != nil {
+		return "", nil, fmt.Errorf("matrix: create space: %w", err)
+	}
+	newSpace = resp.RoomID
+	if parentSpace == "" {
+		return newSpace, nil, nil
+	}
+	via := serverPart(string(c.mx.UserID))
+	if _, e := c.mx.SendStateEvent(ctx, parentSpace, event.StateSpaceChild, string(newSpace),
+		&event.SpaceChildEventContent{Via: []string{via}}); e != nil {
+		parentLinkErr = fmt.Errorf("link m.space.child in parent %s: %w", parentSpace, e)
+	}
+	if _, e := c.mx.SendStateEvent(ctx, newSpace, event.StateSpaceParent, string(parentSpace),
+		&event.SpaceParentEventContent{Via: []string{via}, Canonical: true}); e != nil {
+		log.Printf("[matrix] m.space.parent in new space %s failed: %v", newSpace, e)
+	}
+	return newSpace, parentLinkErr, nil
 }
 
 // serverPart returns the homeserver portion of "@user:server" or
@@ -357,6 +561,11 @@ func serverPart(matrixID string) string {
 // of, by reading the room's m.space.parent state events. Returns an
 // empty slice when the room is not in any space, or on error reading
 // state. Order is unspecified (rooms may belong to multiple spaces).
+//
+// Caveat: many clients (incl. Element) only set m.space.child in the
+// parent and NOT m.space.parent in the child, so this can return [] for
+// rooms that are nonetheless visibly nested. For walking up the tree
+// reliably, use SpaceHierarchy which is bidirectional.
 func (c *Client) ParentSpaces(ctx context.Context, roomID id.RoomID) ([]id.RoomID, error) {
 	state, err := c.mx.State(ctx, roomID)
 	if err != nil {
@@ -370,6 +579,49 @@ func (c *Client) ParentSpaces(ctx context.Context, roomID id.RoomID) ([]id.RoomI
 		}
 	}
 	return out, nil
+}
+
+// SpaceHierarchy scans every Space the bot is joined to and reads its
+// m.space.child events, returning a map child → parent Spaces. This is
+// the inverse of m.space.parent and works around clients that publish
+// only m.space.child (Element being the canonical case): walking up
+// purely via ParentSpaces stops at the first Space the user added via
+// Element's "Add to Space" UI without echoing m.space.parent in the
+// child. Empty-via entries (i.e. removed links) are skipped.
+//
+// Cost: one /joined_rooms call + one State call per joined room.
+// Acceptable for slash-command use; cache caller-side if hot.
+func (c *Client) SpaceHierarchy(ctx context.Context) (map[id.RoomID][]id.RoomID, error) {
+	joined, err := c.mx.JoinedRooms(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("matrix: joined_rooms: %w", err)
+	}
+	childToParents := map[id.RoomID][]id.RoomID{}
+	for _, r := range joined.JoinedRooms {
+		state, err := c.mx.State(ctx, r)
+		if err != nil {
+			continue
+		}
+		children := state[event.StateSpaceChild]
+		if len(children) == 0 {
+			continue // not a Space (or a Space with no children)
+		}
+		for stateKey, evt := range children {
+			if stateKey == "" || evt == nil {
+				continue
+			}
+			var content struct {
+				Via []string `json:"via"`
+			}
+			_ = json.Unmarshal(evt.Content.VeryRaw, &content)
+			if len(content.Via) == 0 {
+				continue // empty via = link removed
+			}
+			child := id.RoomID(stateKey)
+			childToParents[child] = append(childToParents[child], r)
+		}
+	}
+	return childToParents, nil
 }
 
 // Sync runs the long-poll sync loop until ctx is cancelled.
@@ -480,21 +732,42 @@ func (c *Client) installHandlers() {
 			if _, err := c.mx.JoinRoom(ctx, childID.String(), req); err != nil {
 				log.Printf("[matrix] auto-join space child %s (parent %s) failed: %v — invite the bot manually if needed",
 					childID, evt.RoomID, err)
-			} else {
-				log.Printf("[matrix] auto-joined space child %s (parent %s)",
-					childID, evt.RoomID)
+				return
 			}
+			log.Printf("[matrix] auto-joined space child %s (parent %s)",
+				childID, evt.RoomID)
+
+			// If the child is itself a Space (sub-Space used as a
+			// project), let higher layers auto-initialise project
+			// state. Detached goroutine because StateEvent calls hit
+			// the homeserver and we don't want to stall the syncer.
+			c.mu.Lock()
+			h := c.spaceJoined
+			c.mu.Unlock()
+			if h == nil {
+				return
+			}
+			parentID := evt.RoomID
+			go func() {
+				bg := context.Background()
+				isSpace, err := c.IsSpace(bg, childID)
+				if err != nil || !isSpace {
+					return
+				}
+				name, _ := c.RoomName(bg, childID)
+				h(bg, parentID, childID, name)
+			}()
 		})
 	}
 
 	// m.room.message — cryptohelper has already decrypted by the
-	// time the syncer calls us, so the content is plain text.
+	// time the syncer calls us, so msg content is plaintext.
 	syncer.OnEventType(event.EventMessage, func(ctx context.Context, evt *event.Event) {
 		if evt.Sender == c.mx.UserID {
 			return // ignore our own echoes
 		}
 		msg := evt.Content.AsMessage()
-		if msg == nil || msg.MsgType != event.MsgText {
+		if msg == nil {
 			return
 		}
 		// Skip edits — we only react to the first send. Edits show up
@@ -502,8 +775,36 @@ func (c *Client) installHandlers() {
 		if msg.NewContent != nil {
 			return
 		}
-		text := strings.TrimSpace(msg.Body)
-		if text == "" {
+
+		im := IncomingMessage{
+			RoomID:  evt.RoomID,
+			EventID: evt.ID,
+			Sender:  evt.Sender,
+		}
+
+		switch msg.MsgType {
+		case event.MsgText, event.MsgNotice:
+			im.Text = strings.TrimSpace(msg.Body)
+			if im.Text == "" {
+				return
+			}
+		case event.MsgImage, event.MsgFile, event.MsgVideo, event.MsgAudio:
+			if c.mediaDir == "" {
+				log.Printf("[matrix] %s media event in %s dropped: MediaDir not configured", msg.MsgType, evt.RoomID)
+				return
+			}
+			att, err := c.downloadAttachment(ctx, msg, evt.ID)
+			if err != nil {
+				log.Printf("[matrix] download attachment %s failed: %v", evt.ID, err)
+				return
+			}
+			im.Attachments = []Attachment{att}
+			// Caption only — GetCaption returns body when filename
+			// differs (Element's "add caption" feature), "" otherwise.
+			// Avoids surfacing the bare filename as a user text turn.
+			im.Text = strings.TrimSpace(msg.GetCaption())
+		default:
+			// Unknown msgtype — ignore.
 			return
 		}
 
@@ -513,8 +814,163 @@ func (c *Client) installHandlers() {
 		if h == nil {
 			return
 		}
-		h(ctx, evt.RoomID, evt.ID, evt.Sender, text)
+		h(ctx, im)
 	})
+
+	// m.reaction events — the bot's own reactions are filtered out so
+	// the bridge only sees genuine user clicks on its quick-reply
+	// messages. Spec: ReactionEventContent.RelatesTo.{EventID,Key} are
+	// authoritative; Type is always m.annotation for reactions.
+	syncer.OnEventType(event.EventReaction, func(ctx context.Context, evt *event.Event) {
+		if evt.Sender == c.mx.UserID {
+			return
+		}
+		content := evt.Content.AsReaction()
+		if content == nil {
+			return
+		}
+		rel := content.RelatesTo
+		if rel.Type != event.RelAnnotation || rel.EventID == "" || rel.Key == "" {
+			return
+		}
+		c.mu.Lock()
+		h := c.reaction
+		c.mu.Unlock()
+		if h == nil {
+			return
+		}
+		h(ctx, evt.RoomID, rel.EventID, evt.Sender, rel.Key)
+	})
+}
+
+// downloadAttachment fetches the media payload of a media message
+// event, decrypting with the embedded EncryptedFileInfo when the room
+// is E2EE. The plaintext bytes are written under c.mediaDir as
+// "<eventID>_<sanitized-filename>" and the resulting Attachment is
+// returned. Best-effort mime detection: prefer the event's
+// FileInfo.MimeType when present; otherwise sniff the first 512 bytes.
+func (c *Client) downloadAttachment(ctx context.Context, msg *event.MessageEventContent, eventID id.EventID) (Attachment, error) {
+	var (
+		data []byte
+		err  error
+	)
+	switch {
+	case msg.File != nil:
+		// Encrypted attachment: download ciphertext from the embedded
+		// URL, then decrypt with the per-file key.
+		mxc, perr := msg.File.URL.Parse()
+		if perr != nil {
+			return Attachment{}, fmt.Errorf("parse encrypted mxc: %w", perr)
+		}
+		cipher, derr := c.mx.DownloadBytes(ctx, mxc)
+		if derr != nil {
+			return Attachment{}, fmt.Errorf("download encrypted: %w", derr)
+		}
+		data, err = msg.File.Decrypt(cipher)
+		if err != nil {
+			return Attachment{}, fmt.Errorf("decrypt attachment: %w", err)
+		}
+	case msg.URL != "":
+		mxc, perr := msg.URL.Parse()
+		if perr != nil {
+			return Attachment{}, fmt.Errorf("parse mxc: %w", perr)
+		}
+		data, err = c.mx.DownloadBytes(ctx, mxc)
+		if err != nil {
+			return Attachment{}, fmt.Errorf("download: %w", err)
+		}
+	default:
+		return Attachment{}, fmt.Errorf("media event has neither url nor file")
+	}
+
+	mime := ""
+	if msg.Info != nil && msg.Info.MimeType != "" {
+		mime = msg.Info.MimeType
+	}
+	if mime == "" {
+		probe := data
+		if len(probe) > 512 {
+			probe = probe[:512]
+		}
+		mime = http.DetectContentType(probe)
+	}
+
+	kind := "file"
+	switch {
+	case strings.HasPrefix(mime, "image/"):
+		kind = "image"
+	case strings.HasPrefix(mime, "video/"):
+		kind = "video"
+	case strings.HasPrefix(mime, "audio/"):
+		kind = "audio"
+	}
+
+	if err := os.MkdirAll(c.mediaDir, 0o700); err != nil {
+		return Attachment{}, fmt.Errorf("mkdir media dir: %w", err)
+	}
+	origName := msg.GetFileName()
+	filename := sanitizeFilename(origName)
+	if filename == "" {
+		filename = "attachment" + extFromMime(mime)
+	} else if filepath.Ext(filename) == "" {
+		filename += extFromMime(mime)
+	}
+	// Prepend event id so a sloppy filename collision can't overwrite
+	// an earlier attachment from a different event in the same room.
+	stem := sanitizeFilename(string(eventID))
+	path := filepath.Join(c.mediaDir, stem+"_"+filename)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return Attachment{}, fmt.Errorf("write %s: %w", path, err)
+	}
+	log.Printf("[matrix] downloaded %s attachment (%d B) → %s", kind, len(data), path)
+	return Attachment{
+		Path:     path,
+		MimeType: mime,
+		Kind:     kind,
+		Filename: origName,
+	}, nil
+}
+
+// sanitizeFilename strips path separators and characters likely to
+// trip up shells / runtimes. Empty input returns "".
+func sanitizeFilename(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	r := strings.NewReplacer(
+		"/", "_", "\\", "_", ":", "_", "*", "_",
+		"?", "_", "\"", "_", "<", "_", ">", "_", "|", "_",
+		" ", "_", "\t", "_", "\n", "_",
+	)
+	out := r.Replace(s)
+	if len(out) > 80 {
+		out = out[:80]
+	}
+	return out
+}
+
+// extFromMime returns a "." extension for a common mime type, or "" if
+// unknown. Keep this list short — too aggressive guessing causes more
+// confusion than it solves.
+func extFromMime(mime string) string {
+	switch mime {
+	case "image/png":
+		return ".png"
+	case "image/jpeg", "image/jpg":
+		return ".jpg"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	case "video/mp4":
+		return ".mp4"
+	case "audio/ogg":
+		return ".ogg"
+	case "audio/mpeg":
+		return ".mp3"
+	}
+	return ""
 }
 
 // normalizeUserID turns "claude-coder" into "claude-coder" for the

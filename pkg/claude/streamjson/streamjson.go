@@ -22,6 +22,7 @@ package streamjson
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -49,6 +50,10 @@ type Options struct {
 	// Model / FallbackModel are passed via --model / --fallback-model.
 	Model         string
 	FallbackModel string
+
+	// Effort maps to --effort (low / medium / high / xhigh / max).
+	// Empty leaves claude's default in place.
+	Effort string
 
 	// PermissionMode maps to --permission-mode. Empty leaves the
 	// default in place. Valid values: default, acceptEdits, plan,
@@ -120,6 +125,57 @@ func NewTextMessage(text string) UserMessage {
 	return m
 }
 
+// ImageBlock is one image attachment for NewMultimodalMessage. Data
+// is the raw image bytes; the helper base64-encodes them inline. The
+// caller owns the bytes.
+type ImageBlock struct {
+	MediaType string // e.g. "image/png"
+	Data      []byte
+}
+
+// NewMultimodalMessage builds a UserMessage with N image content
+// blocks followed by an optional trailing text block. Images go first
+// because the model attends to them as context for the text caption.
+// Empty text + zero images returns an error.
+func NewMultimodalMessage(text string, images []ImageBlock) (UserMessage, error) {
+	if text == "" && len(images) == 0 {
+		return UserMessage{}, fmt.Errorf("streamjson: NewMultimodalMessage needs at least text or one image")
+	}
+	type imageSource struct {
+		Type      string `json:"type"`       // always "base64"
+		MediaType string `json:"media_type"` // e.g. "image/png"
+		Data      string `json:"data"`       // base64-encoded image bytes
+	}
+	type block struct {
+		Type   string      `json:"type"` // "image" or "text"
+		Source *imageSource `json:"source,omitempty"`
+		Text   string      `json:"text,omitempty"`
+	}
+	blocks := make([]block, 0, len(images)+1)
+	for _, img := range images {
+		mt := img.MediaType
+		if mt == "" {
+			mt = "image/png"
+		}
+		blocks = append(blocks, block{
+			Type: "image",
+			Source: &imageSource{
+				Type:      "base64",
+				MediaType: mt,
+				Data:      base64.StdEncoding.EncodeToString(img.Data),
+			},
+		})
+	}
+	if text != "" {
+		blocks = append(blocks, block{Type: "text", Text: text})
+	}
+	var m UserMessage
+	m.Type = "user"
+	m.Message.Role = "user"
+	m.Message.Content = blocks
+	return m, nil
+}
+
 // BuildArgs renders just the claude flag list from opts (no binary).
 // Exposed so callers wrapping claude in another process (e.g. `docker
 // run -i ... claude <args>`) can build the same argv tail without
@@ -146,6 +202,9 @@ func BuildArgs(opts Options) ([]string, error) {
 	}
 	if opts.FallbackModel != "" {
 		args = append(args, "--fallback-model", opts.FallbackModel)
+	}
+	if opts.Effort != "" {
+		args = append(args, "--effort", opts.Effort)
 	}
 	if opts.PermissionMode != "" {
 		args = append(args, "--permission-mode", opts.PermissionMode)

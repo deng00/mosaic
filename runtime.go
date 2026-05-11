@@ -128,9 +128,9 @@ func (r *AgentRuntime) Create(req agent.CreateRequest) (agent.AgentInfo, error) 
 		Password:              pw,
 		DeviceName:            displayName,
 		AutoJoinSpaceChildren: true,
-		Claude: ClaudeConfig{
+		Model:                 req.Model,
+		Claude: ClaudeRuntimeConfig{
 			PermissionMode: "bypassPermissions",
-			Model:          req.Model,
 		},
 	}
 
@@ -337,6 +337,40 @@ func (r *AgentRuntime) Projects() []agent.ProjectInfo {
 		})
 	}
 	return out
+}
+
+// EnsureProject implements agent.AgentManager.EnsureProject. Atomic
+// "insert if absent": returns created=true only when no entry existed
+// for spaceID before this call, so concurrent observers of the same
+// new Space can pick a single winner for one-shot side effects like
+// creating a welcome room.
+func (r *AgentRuntime) EnsureProject(spaceID, name string) (bool, error) {
+	if spaceID == "" {
+		return false, fmt.Errorf("spaceID required")
+	}
+	r.mu.Lock()
+	if r.cfg.Projects == nil {
+		r.cfg.Projects = map[string]ProjectConfigYAML{}
+	}
+	if _, exists := r.cfg.Projects[spaceID]; exists {
+		r.mu.Unlock()
+		return false, nil
+	}
+	r.cfg.Projects[spaceID] = ProjectConfigYAML{Name: name}
+	if err := writeConfig(r.cfgPath, r.cfg); err != nil {
+		// Best-effort rollback so a failed write doesn't leave a
+		// phantom entry visible to in-process callers.
+		delete(r.cfg.Projects, spaceID)
+		r.mu.Unlock()
+		return false, err
+	}
+	pjs := convertProjectsConfig(r.cfg.Projects)
+	bridges := append([]*agent.Bridge(nil), r.bridges...)
+	r.mu.Unlock()
+	for _, b := range bridges {
+		b.InvalidateResolutions(pjs, nil)
+	}
+	return true, nil
 }
 
 // SetProject implements agent.AgentManager.SetProject. Empty fields

@@ -52,6 +52,15 @@ type AgentManager interface {
 	// effect on the next claude spawn.
 	SetProject(spaceID, name, cwd, model string) error
 
+	// EnsureProject inserts a Project entry for spaceID with the
+	// given name iff one doesn't already exist. Returns created=true
+	// only on first insert — used by the auto-init flow so that
+	// follow-on side effects (e.g. creating a "welcome" room) run
+	// exactly once even when several agents observe the new Space
+	// concurrently. Empty name is allowed; caller is responsible for
+	// deciding a fallback.
+	EnsureProject(spaceID, name string) (created bool, err error)
+
 	// Members returns the current allow-list (non-admin users
 	// authorised to drive agents). Admins are NOT included here —
 	// callers should check Admins separately or use Bridge.isAllowed.

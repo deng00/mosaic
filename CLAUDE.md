@@ -47,6 +47,15 @@ up the chain. If you want shared cwd at the Org level, you'd configure it
 on each Project-Space individually (or extend resolve to walk up — open
 design point).
 
+**Auto-init on new sub-Space**: when a bot auto-joins an `m.space.child`
+whose target is itself a Space (i.e. a project Space created under an
+existing Org Space), the bridge fires `EnsureProject` (insert-if-absent
+keyed by Space ID, default name = the Space's `m.room.name`) and the
+winning agent creates a `welcome` topic-room as the first child. Multi-
+agent races are resolved by `EnsureProject` returning `created=true`
+exactly once. Direct invites to a top-level Space don't trigger this —
+only the auto-join-from-parent path.
+
 ## Core data model
 
 ```

@@ -37,6 +37,11 @@ import (
 	"syscall"
 
 	"github.com/deng00/mosaic/pkg/agent"
+	// Register all runtime drivers (init() side-effect). Add a new
+	// line here per new runtime; the agent.Options.Runtime field is
+	// resolved against the registry built up by these imports.
+	_ "github.com/deng00/mosaic/pkg/runtime/claude"
+	_ "github.com/deng00/mosaic/pkg/runtime/codex"
 	"github.com/deng00/mosaic/pkg/dispatch"
 	"github.com/deng00/mosaic/pkg/matrix"
 	"github.com/deng00/mosaic/pkg/task"
@@ -197,6 +202,7 @@ func runBot(ctx context.Context, fc *FileConfig, bc BotConfig, mgr *AgentRuntime
 		CryptoDB:              filepath.Join(dataDir, "crypto.db"),
 		PickleKey:             pickle,
 		AutoJoinSpaceChildren: bc.AutoJoinSpaceChildren,
+		MediaDir:              filepath.Join(dataDir, "attachments"),
 	})
 	if err != nil {
 		log.Printf("[%s] login: %v", bc.ID, err)
@@ -227,18 +233,25 @@ func runBot(ctx context.Context, fc *FileConfig, bc BotConfig, mgr *AgentRuntime
 
 	rooms := convertRoomsConfig(fc.Rooms)
 	projects := convertProjectsConfig(fc.Projects)
-	binary := bc.Claude.Binary
-	if binary == "" {
-		binary = "claude"
-	}
+	binary := bc.Binary // empty → driver picks default per runtime
 	pmode := bc.Claude.PermissionMode
 	if pmode == "" {
 		pmode = "bypassPermissions"
 	}
+	model := bc.Model
+	if model == "" {
+		model = "claude-opus-4-7"
+	}
+	effort := bc.Effort
+	if effort == "" {
+		effort = "high"
+	}
 
 	br := agent.New(mx, agent.Options{
-		Cwd:            bc.Claude.Cwd,
-		Model:          bc.Claude.Model,
+		Runtime:        bc.Runtime,
+		Cwd:            bc.Cwd,
+		Model:          model,
+		Effort:         effort,
 		PermissionMode: pmode,
 		Binary:         binary,
 		Projects:       projects,
@@ -249,7 +262,7 @@ func runBot(ctx context.Context, fc *FileConfig, bc BotConfig, mgr *AgentRuntime
 		Admins:         fc.Admins,
 		Members:        fc.Members,
 		ServerName:     fc.ServerName,
-		Env:            bc.Claude.Env,
+		Env:            bc.Env,
 	})
 	if mgr != nil {
 		mgr.trackBridge(bc.ID, br)

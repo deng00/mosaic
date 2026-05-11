@@ -62,10 +62,10 @@ func FormatToolUse(name string, input json.RawMessage) string {
 		if v.ReplaceAll {
 			marker = " (replace_all)"
 		}
-		return fmt.Sprintf("✏️ **Edit** `%s`%s\n```diff\n- %s\n+ %s\n```",
+		return fmt.Sprintf("✏️ **Edit** `%s`%s\n```diff\n%s%s```",
 			relPath(v.FilePath), marker,
-			truncate(oneLine(v.OldString), 100),
-			truncate(oneLine(v.NewString), 100))
+			diffLines("-", v.OldString, 20, 200),
+			diffLines("+", v.NewString, 20, 200))
 
 	case "Grep":
 		var v struct {
@@ -107,18 +107,39 @@ func FormatToolUse(name string, input json.RawMessage) string {
 			truncate(v.Description, 120))
 
 	case "TodoWrite":
-		// Too noisy to surface — claude uses it for internal book-keeping.
+		// Render the actual todo list — Element collapsed the older
+		// "(N items)" summary into a single line that didn't reveal
+		// which todo was in progress, so the user couldn't follow the
+		// agent's plan. One markdown bullet per todo, status icon up
+		// front so it scans at a glance.
 		var v struct {
 			Todos []struct {
-				Content string `json:"content"`
-				Status  string `json:"status"`
+				Content    string `json:"content"`
+				ActiveForm string `json:"activeForm"`
+				Status     string `json:"status"`
 			} `json:"todos"`
 		}
 		_ = json.Unmarshal(input, &v)
 		if len(v.Todos) == 0 {
 			return "📋 **TodoWrite** _(empty)_"
 		}
-		return fmt.Sprintf("📋 **TodoWrite** (%d items)", len(v.Todos))
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "📋 **TodoWrite** (%d)\n", len(v.Todos))
+		for _, t := range v.Todos {
+			icon := "⬜"
+			text := t.Content
+			switch t.Status {
+			case "completed":
+				icon = "✅"
+			case "in_progress":
+				icon = "🔄"
+				if t.ActiveForm != "" {
+					text = t.ActiveForm
+				}
+			}
+			fmt.Fprintf(&sb, "- %s %s\n", icon, truncate(oneLine(text), 200))
+		}
+		return strings.TrimRight(sb.String(), "\n")
 
 	case "WebFetch":
 		var v struct {
@@ -192,6 +213,34 @@ func relPath(p string) string {
 		}
 	}
 	return p
+}
+
+// diffLines renders s as a block of diff lines, each prefixed with
+// "- " or "+ ". Long files are capped at maxLines (extra lines folded
+// into a "… N more lines" tail), and any single line longer than
+// maxLineLen is truncated with an ellipsis. Trailing empty line is
+// dropped so the caller's surrounding fence sits tight.
+func diffLines(prefix, s string, maxLines, maxLineLen int) string {
+	if s == "" {
+		return prefix + "\n"
+	}
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	var sb strings.Builder
+	n := len(lines)
+	shown := n
+	if shown > maxLines {
+		shown = maxLines
+	}
+	for i := 0; i < shown; i++ {
+		sb.WriteString(prefix)
+		sb.WriteByte(' ')
+		sb.WriteString(truncate(lines[i], maxLineLen))
+		sb.WriteByte('\n')
+	}
+	if n > shown {
+		fmt.Fprintf(&sb, "%s … %d more line(s)\n", prefix, n-shown)
+	}
+	return sb.String()
 }
 
 func oneLine(s string) string {
