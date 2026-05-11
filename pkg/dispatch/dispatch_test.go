@@ -2,7 +2,10 @@ package dispatch
 
 import (
 	"context"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +16,23 @@ import (
 	"github.com/deng00/mosaic/pkg/task"
 	"github.com/deng00/mosaic/pkg/workspace"
 )
+
+func mustGit(t *testing.T, cwd string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = cwd
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s in %q: %v\n%s", strings.Join(args, " "), cwd, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func osWriteFile(path, body string) error {
+	return os.WriteFile(path, []byte(body), 0o644)
+}
+
+func osStat(path string) (os.FileInfo, error) { return os.Stat(path) }
 
 // fakeBridge records calls instead of touching Matrix.
 type fakeBridge struct {
@@ -91,7 +111,9 @@ func newFixture(t *testing.T) (*Dispatcher, *task.Store, *fakeBridge, *fakeSink,
 			"!space:localhost": {
 				SpaceID: "!space:localhost", Name: "Demo", Prefix: "MOS",
 				WorkspaceRoot: filepath.Join(dir, "ws"),
-				Hooks:         workspace.Hooks{Timeout: 5 * time.Second},
+				// ":" is a bash no-op — overrides the default git-clone
+				// hook that would otherwise need a real source repo.
+				Hooks: workspace.Hooks{AfterCreate: ":", Timeout: 5 * time.Second},
 			},
 		},
 	}
@@ -194,6 +216,65 @@ func TestNoDispatchWithoutAssigneeAndNoIdleAgent(t *testing.T) {
 	defer br.mu.Unlock()
 	if br.kickoff != "" {
 		t.Errorf("should not have kicked off: %q", br.kickoff)
+	}
+}
+
+// TestDefaultAfterCreateClonesProjectCwd exercises the built-in
+// after_create hook (no per-project workspace_hooks). Sets up a real
+// git repo as the source dir, runs dispatch, and asserts the workspace
+// is a git checkout pointing at the source dir's origin.
+func TestDefaultAfterCreateClonesProjectCwd(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source")
+	mustGit(t, "", "init", "-b", "main", source)
+	// Plant a file so clone has something to copy.
+	if err := osWriteFile(filepath.Join(source, "README.md"), "hello\n"); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, source, "-c", "user.email=t@t", "-c", "user.name=t", "add", ".")
+	mustGit(t, source, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "x")
+	mustGit(t, source, "remote", "add", "origin", "git@github.com:fake/repo.git")
+
+	store := task.NewStore(filepath.Join(dir, "projects"))
+	br := &fakeBridge{uid: "@cindy:localhost", createdRoomID: "!task-room:localhost"}
+	sink := &fakeSink{
+		bridges: map[string]AgentBridge{"cindy": br},
+		uidToID: map[string]string{"@cindy:localhost": "cindy"},
+		order:   []string{"cindy"},
+		projects: map[string]ProjectMeta{
+			"!space:localhost": {
+				SpaceID: "!space:localhost", Name: "Demo", Prefix: "MOS",
+				WorkspaceRoot: filepath.Join(dir, "ws"),
+				Cwd:           source,
+				// No AfterCreate → dispatcher injects defaultAfterCreate.
+				Hooks: workspace.Hooks{Timeout: 30 * time.Second},
+			},
+		},
+	}
+	d := New(Config{
+		DataDir:              dir,
+		DefaultWorkspaceRoot: filepath.Join(dir, "ws"),
+	}, store, &fakeMemory{}, sink)
+	d.Start()
+
+	tk, _ := store.Create("!space:localhost", "MOS",
+		task.CreateInput{Title: "x", Assignee: "@cindy:localhost"})
+	st := task.StateInProgress
+	_, _ = store.Update("!space:localhost", tk.ID, task.UpdateInput{State: &st})
+
+	waitFor(t, "kickoff", func() bool {
+		br.mu.Lock()
+		defer br.mu.Unlock()
+		return br.kickoff != ""
+	})
+
+	wsDir := filepath.Join(dir, "ws", "MOS-1")
+	if _, err := osStat(filepath.Join(wsDir, "README.md")); err != nil {
+		t.Fatalf("workspace not populated by clone: %v", err)
+	}
+	gotRemote := mustGit(t, wsDir, "config", "--get", "remote.origin.url")
+	if gotRemote != "git@github.com:fake/repo.git" {
+		t.Errorf("remote not rewritten to source's origin: %q", gotRemote)
 	}
 }
 

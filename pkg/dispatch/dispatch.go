@@ -238,6 +238,13 @@ func (d *Dispatcher) startTask(spaceID string, t task.Task) {
 	if hooks.Timeout <= 0 {
 		hooks.Timeout = 5 * time.Minute
 	}
+	// Default after_create: clone the project's source dir into the
+	// workspace and copy its `origin` remote URL over so the agent's
+	// push lands at the right place. Skipped only if the user supplied
+	// their own after_create.
+	if hooks.AfterCreate == "" {
+		hooks.AfterCreate = defaultAfterCreate(expandHome(proj.Cwd))
+	}
 	wsm := workspace.NewManager(root, hooks)
 	wsCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
@@ -389,6 +396,42 @@ func (d *Dispatcher) fail(spaceID, taskID string, cause error) {
 	if _, err := d.store.Update(spaceID, taskID, task.UpdateInput{State: &st}); err != nil {
 		log.Printf("[dispatch] also failed to revert state: %v", err)
 	}
+}
+
+// defaultAfterCreate is the workspace bootstrap script used when the
+// project has no explicit workspace_hooks.after_create. Behavior:
+//
+//   - clones <projectCwd> into the workspace via local file:// (fast,
+//     and works even when the launchd-launched mosaic process has no
+//     SSH agent socket — the source dir is already on disk)
+//   - copies the source dir's `origin` remote URL onto the workspace
+//     so the agent's eventual `git push` lands at the right place
+//   - leaves git user.name / user.email untouched — agent inherits
+//     whatever ~/.gitconfig has configured globally
+//
+// Errors loudly when projectCwd is not a git repo so the dispatcher
+// reverts the task to todo with a clear cause instead of silently
+// dropping the agent into an empty directory.
+func defaultAfterCreate(projectCwd string) string {
+	q := shellQuote(projectCwd)
+	return `set -e
+if [ ! -d ` + q + `/.git ]; then
+  echo "mosaic: source dir is not a git repo: " ` + q + ` >&2
+  exit 1
+fi
+git clone ` + q + ` .
+remote_url=$(git -C ` + q + ` config --get remote.origin.url || true)
+if [ -n "$remote_url" ]; then
+  git remote set-url origin "$remote_url"
+fi
+`
+}
+
+// shellQuote returns a single-quoted bash literal of s. Replaces every
+// `'` with `'\''` so the result is safe to splice into a `set -e`
+// script without shell-injection.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // expandHome resolves a leading ~ to $HOME.
