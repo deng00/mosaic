@@ -184,6 +184,20 @@ func (b *Bridge) MatrixUserID() id.UserID {
 	return b.mx.UserID()
 }
 
+// EnsureWidget upserts a widget state event in roomID. The bot must
+// be a joined member of roomID with permission to set state. Idempotent
+// — same stateKey overwrites the same event.
+func (b *Bridge) EnsureWidget(ctx context.Context, roomID id.RoomID, stateKey, name, widgetURL string) error {
+	return b.mx.EnsureWidget(ctx, roomID, stateKey, name, widgetURL)
+}
+
+// HasJoinedRoom reports whether this bridge's bot account is currently
+// in roomID. Used by callers that need to wait until membership is in
+// place before sending state events.
+func (b *Bridge) HasJoinedRoom(ctx context.Context, roomID id.RoomID) bool {
+	return b.mx.HasJoinedRoom(ctx, roomID)
+}
+
 // CreateTaskRoom asks the underlying matrix client to create a topic-
 // room owned by this agent, attached to parentSpace, with the given
 // invitees. Convenience wrapper so the dispatcher doesn't need its

@@ -93,6 +93,12 @@ func main() {
 		dispatcher.Start()
 		log.Printf("[dispatch] enabled (workspaceRoot=%s, callbackAPI=%q)", dCfg.DefaultWorkspaceRoot, dCfg.APIBase)
 
+		// Push an Element widget into every Space configured with
+		// task_prefix so users get a "Tasks" entry in the Space's
+		// Widgets panel without manual setup. Idempotent + retried
+		// in the background until at least one agent is joined.
+		startWidgetPusher(ctx, fc, webSrv, runtime)
+
 		for _, bc := range all {
 			wg.Add(1)
 			botCtx, botCancel := context.WithCancel(ctx)

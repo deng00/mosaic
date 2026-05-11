@@ -255,6 +255,48 @@ func (c *Client) DeleteUserRoomTag(ctx context.Context, roomID id.RoomID, tag st
 	return err
 }
 
+// widgetEventType is Element's legacy state-event type for room/space
+// widgets. The newer `m.widget` type isn't yet honored by every Element
+// build; sticking with the im.vector one keeps it visible in the
+// "Widgets" panel of all current Element clients.
+var widgetEventType = event.Type{Type: "im.vector.modular.widgets", Class: event.StateEventType}
+
+// EnsureWidget upserts an Element widget state event in roomID.
+// stateKey is the widget's stable id (use a deterministic value so
+// repeated calls are idempotent — they edit the same state event).
+// Pass empty url to delete the widget (Element interprets empty
+// content as "removed"). Common content fields:
+//
+//	type: "customwidget"  // generic external URL
+//	url:  the URL Element will iframe
+//	name: visible label in the Widgets panel
+//	data: arbitrary JSON forwarded to the widget
+func (c *Client) EnsureWidget(ctx context.Context, roomID id.RoomID, stateKey, name, widgetURL string) error {
+	content := map[string]any{
+		"type": "customwidget",
+		"url":  widgetURL,
+		"name": name,
+		"data": map[string]any{},
+	}
+	_, err := c.mx.SendStateEvent(ctx, roomID, widgetEventType, stateKey, content)
+	if err != nil {
+		return fmt.Errorf("matrix: ensure widget %s in %s: %w", stateKey, roomID, err)
+	}
+	return nil
+}
+
+// HasJoinedRoom reports whether the bot's account is currently joined
+// to roomID. Used by the widget pusher to wait until the bot is in a
+// Space before trying to set state events on it.
+func (c *Client) HasJoinedRoom(ctx context.Context, roomID id.RoomID) bool {
+	resp, err := c.mx.JoinedMembers(ctx, roomID)
+	if err != nil {
+		return false
+	}
+	_, ok := resp.Joined[c.mx.UserID]
+	return ok
+}
+
 // CreateRoomOpts configures a per-task topic-room creation.
 type CreateRoomOpts struct {
 	Name        string      // visible name in Element
