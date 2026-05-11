@@ -144,10 +144,10 @@ know any of ours), so `!` is the noise-free alternative.
 ```
 General:    /help  /status  /new-session  /compact  /archive  /unarchive
 Agent mgmt: /agent help|list|new
-Project:    /project help|status|list|list-all|set-cwd|name
+Project:    /project help|status|list|list-all|cwd|name
 ```
 
-`/agent new` and `/project set-cwd|name` are **admin-gated** (config
+`/agent new` and `/project cwd|name` are **admin-gated** (config
 `admins:` list of full Matrix user IDs).
 
 `/agent new` accepts a slock-style multi-line body:

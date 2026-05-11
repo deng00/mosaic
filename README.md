@@ -64,7 +64,7 @@ members:
 - **三层 Matrix 结构**：Org Space (`CoinSummer`) → Project Space (`cs-argus-agent`) → Topic Room (`feat-acl-rewrite` / `daily-ops`)
 - **每个 agent 有独立人格**：`data/agents/<id>/MEMORY.md` 是 agent 的 role / persona 文件
 - **Project memory 跨 agent 共享**：`data/projects/<spaceID>/PROJECT.md`、`SUMMARY.md`，谁 `/compact` 写入，全员下次 session 自动注入
-- **Slash 命令 chat-driven 管理**：`/agent new`、`/project set-cwd`，配置即时生效，不重启
+- **Slash 命令 chat-driven 管理**：`/agent new`、`/project cwd`，配置即时生效，不重启
 - **真 E2EE**：Synapse 全程只见密文；orchestrator 必须在持密钥的客户端（即 mosaic 进程本身），所以我们不是 server-side bot
 
 详细架构 / 决策记录 → [`CLAUDE.md`](CLAUDE.md)。
@@ -157,7 +157,7 @@ agents:
       cwd: ~/Code
       permission_mode: bypassPermissions
 
-projects: {}    # 用 /project set-cwd 在聊天里加，不必手填
+projects: {}    # 用 /project cwd 在聊天里加，不必手填
 rooms: {}
 ```
 
@@ -195,7 +195,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.you.mosaic.plist
 3. 创建 Space `Personal`、子 Space `my-project`、子 Space 里建 room `daily`
 4. 邀请 `@claude-bot:localhost` 进 room
 5. 发消息——bot 立刻流式回复
-6. room 里发 `!project set-cwd ~/Code/my-project` —— 写入 config，下次新 session 自动用此 cwd
+6. room 里发 `!project cwd ~/Code/my-project` —— 写入 config，下次新 session 自动用此 cwd
 
 ## 给加入别人 server 的同事用
 
@@ -274,7 +274,7 @@ agents:
 
   # 选项 2：还没注册的 agent → 跑 /agent new 自动创建（需要 shared_secret）
 
-projects: {}    # 用 /project set-cwd 在聊天里加
+projects: {}    # 用 /project cwd 在聊天里加
 rooms: {}
 ```
 
@@ -343,7 +343,7 @@ model: sonnet
 | `/project status` | 当前 room 解析的 Space + project + cwd |
 | `/project list` | 当前 Space 的 project（如果有） |
 | `/project list-all` | 跨所有 Space 的 project 列表（管理员看全局） |
-| `/project set-cwd <path>` | 给当前 room 所属 Space 设工作目录 ⛔ admin |
+| `/project cwd <path>` | 给当前 room 所属 Space 设工作目录 ⛔ admin |
 | `/project name <name>` | 给当前 Space 起个可读名字 ⛔ admin |
 | `/project help` | 帮助 |
 
