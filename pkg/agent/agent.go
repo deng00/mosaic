@@ -14,6 +14,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -152,13 +153,20 @@ const membershipTTL = 5 * time.Minute
 // path and the ask_user reaction path so behaviour stays consistent.
 const inboxFullMsg = "⏳ 排队太多了，暂时无法接收。请稍候再试。"
 
-// pendingAsk tracks an open <ask_user> question awaiting a number-emoji
-// reaction. eventID is the Matrix message the bot pre-seeded with
-// 1️⃣..N reactions; options[i] is the text injected as the next user
-// turn when the user picks emoji (i+1).
+// pendingAsk tracks an open question awaiting a vote. eventID is the
+// poll-start event the bot posted; handlePollResponse matches inbound
+// m.poll.response events against it and looks up options[idx-1] for
+// the chosen answer id ("opt-N"). toolUseID is set only when the
+// prompt originated from an AskUserQuestion tool_use we intercepted —
+// it's used to suppress the SDK's auto-generated error tool_result
+// for that same id (see Bridge.isInterceptedAskToolUseID). Resolution
+// always injects the chosen text as a fresh user turn; the tool
+// channel itself is not fulfilled by us (the SDK pre-resolves it in
+// headless mode).
 type pendingAsk struct {
-	eventID id.EventID
-	options []string
+	eventID   id.EventID
+	options   []string
+	toolUseID string
 }
 
 func New(mx *matrix.Client, opts Options) *Bridge {
@@ -280,7 +288,7 @@ func (b *Bridge) resolve(ctx context.Context, roomID id.RoomID) resolution {
 func (b *Bridge) Start() {
 	b.mx.OnMessage(b.handleMessage)
 	b.mx.OnSpaceJoined(b.handleSpaceJoined)
-	b.mx.OnReaction(b.handleReaction)
+	b.mx.OnPollResponse(b.handlePollResponse)
 }
 
 // askUserProtocol is appended to every spawn's system prompt so the
@@ -315,58 +323,75 @@ Rules:
 - 2 to 10 options. Fewer than 2 = it's not a multiple-choice question, just ask plainly.
 - Each option on its own bullet line ("- " or "* ").
 - Mosaic strips this block from the visible reply and renders the question
-  as a separate message with 1️⃣ 2️⃣ … reactions; the user's pick becomes
-  the next user turn verbatim.
+  as a native Matrix poll (Element shows it as click-to-vote buttons);
+  the user's pick becomes the next user turn verbatim.
 - Don't use this for yes/no — just ask in plain text.
+- Prefer this over the AskUserQuestion tool: that tool fails in Mosaic's
+  headless mode (no TTY), and Mosaic will surface the same poll UI if
+  it sees an AskUserQuestion call — but the model loses a turn waiting
+  on a failed tool_result. Just emit the envelope directly.
 - Don't paste this block inside other text or code fences — it must be
   at the top level of your reply.`
 
-// askUserNumberEmoji maps a 1-based index to the keycap-number emoji
-// Element renders as a button. Indexes outside 1–10 yield "" — the
-// caller should cap option counts at 10.
-func askUserNumberEmoji(i int) string {
-	switch i {
-	case 1:
-		return "1️⃣"
-	case 2:
-		return "2️⃣"
-	case 3:
-		return "3️⃣"
-	case 4:
-		return "4️⃣"
-	case 5:
-		return "5️⃣"
-	case 6:
-		return "6️⃣"
-	case 7:
-		return "7️⃣"
-	case 8:
-		return "8️⃣"
-	case 9:
-		return "9️⃣"
-	case 10:
-		return "🔟"
+// parseAskUserQuestionTool decodes the AskUserQuestion tool_use input
+// into an askUser. Only the first question is rendered today
+// (questions[1..] are ignored — the emoji-reaction UI handles one at
+// a time). multiSelect is dropped on the floor; we always treat the
+// pick as single-select. The auto-appended "Other" free-text option
+// is not surfaced (no free-text input via reactions).
+//
+// Schema (per the SDK tool def):
+//
+//	{
+//	  "questions": [
+//	    { "question": "...",
+//	      "options": [ {"label": "...", ...} ] }
+//	  ]
+//	}
+func parseAskUserQuestionTool(raw json.RawMessage) (askUser, bool) {
+	var v struct {
+		Questions []struct {
+			Question string `json:"question"`
+			Options  []struct {
+				Label string `json:"label"`
+			} `json:"options"`
+		} `json:"questions"`
 	}
-	return ""
-}
-
-// indexFromAskEmoji is the inverse of askUserNumberEmoji. Returns 0
-// for unrelated emojis (the bridge ignores reactions outside the ask
-// keycap set so users can still 👍 / ❤️ messages without triggering
-// a turn injection).
-func indexFromAskEmoji(key string) int {
-	for i := 1; i <= 10; i++ {
-		if askUserNumberEmoji(i) == key {
-			return i
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return askUser{}, false
+	}
+	if len(v.Questions) == 0 {
+		return askUser{}, false
+	}
+	q := v.Questions[0]
+	if q.Question == "" || len(q.Options) < 2 {
+		return askUser{}, false
+	}
+	opts := make([]string, 0, len(q.Options))
+	for _, o := range q.Options {
+		if o.Label == "" {
+			continue
+		}
+		opts = append(opts, o.Label)
+		if len(opts) >= 10 { // matches the <ask_user> envelope 10-option cap
+			break
 		}
 	}
-	return 0
+	if len(opts) < 2 {
+		return askUser{}, false
+	}
+	return askUser{question: q.Question, options: opts}, true
 }
 
-// askUser captures one parsed <ask_user> block.
+// askUser captures one parsed prompt — either a text `<ask_user>`
+// envelope or an `AskUserQuestion` tool_use. toolUseID is set only
+// for the tool-use flavour; it's carried into pendingAsk so the
+// bridge can suppress the SDK's auto-generated error tool_result for
+// the same id (see Bridge.isInterceptedAskToolUseID).
 type askUser struct {
-	question string
-	options  []string
+	question  string
+	options   []string
+	toolUseID string
 }
 
 // extractAskUserBlocks pulls every <ask_user>...</ask_user> block out
@@ -459,54 +484,92 @@ func parseAskBlock(raw string) (askUser, bool) {
 	return askUser{question: question, options: options}, true
 }
 
-// renderAskUser posts the question + numbered options as one Matrix
-// message, pre-seeds 1️⃣..N reactions on it, and stores the room's
-// pendingAsk so handleReaction can resolve the user's pick.
+// renderAskUser posts the prompt as a native Matrix poll
+// (m.poll.start, MSC3381 unstable). Element / Element X render this
+// with built-in click-to-vote buttons. Resolution arrives via
+// handlePollResponse, which references the poll's start event id —
+// stored here as pendingAsk.eventID.
+//
+// Option IDs are "opt-1".."opt-N" so the response handler can recover
+// the chosen index without a separate id→index map.
 func (t *turn) renderAskUser(ctx context.Context, a askUser) {
-	var sb strings.Builder
-	sb.WriteString("❓ ")
-	sb.WriteString(a.question)
-	sb.WriteString("\n\n")
+	answers := make([]matrix.PollAnswer, 0, len(a.options))
 	for i, opt := range a.options {
-		// Blank line between options — goldmark collapses single \n
-		// to a space (paragraph behavior), so a hard line break
-		// requires either two trailing spaces or a blank line. Blank
-		// line wins on portability.
-		fmt.Fprintf(&sb, "%s %s\n\n", askUserNumberEmoji(i+1), opt)
+		answers = append(answers, matrix.PollAnswer{
+			ID:   askOptionID(i + 1),
+			Text: opt,
+		})
 	}
-	sb.WriteString("_点下面对应的数字 emoji 选一个。_")
-
-	evID, err := t.b.mx.SendText(ctx, t.roomID, sb.String())
+	evID, err := t.b.mx.SendPollStart(ctx, t.roomID, a.question, answers)
 	if err != nil {
-		log.Printf("[agent] ask_user send failed: %v", err)
+		log.Printf("[agent] ask_user poll send failed: %v", err)
 		return
 	}
-	for i := range a.options {
-		key := askUserNumberEmoji(i + 1)
-		if err := t.b.mx.SendReaction(ctx, t.roomID, evID, key); err != nil {
-			log.Printf("[agent] ask_user pre-seed reaction %s failed: %v", key, err)
-		}
-	}
 	t.b.mu.Lock()
-	t.b.pendingAsks[t.roomID] = &pendingAsk{eventID: evID, options: a.options}
+	t.b.pendingAsks[t.roomID] = &pendingAsk{
+		eventID:   evID,
+		options:   a.options,
+		toolUseID: a.toolUseID,
+	}
 	t.b.mu.Unlock()
 }
 
-// handleReaction is the m.reaction handler. We only act when the
-// reaction targets an open pendingAsk for the room AND the emoji
-// matches a 1️⃣..🔟 keycap. The first matching reaction wins; we
-// clear the pendingAsk so follow-on clicks don't kick a second turn.
-func (b *Bridge) handleReaction(ctx context.Context, roomID id.RoomID, sourceEventID id.EventID, sender id.UserID, key string) {
-	idx := indexFromAskEmoji(key)
-	if idx == 0 {
+// askOptionID returns the deterministic id for option i (1-based).
+// Kept short and predictable so logs are readable.
+func askOptionID(i int) string {
+	return fmt.Sprintf("opt-%d", i)
+}
+
+// askOptionIndex is the inverse of askOptionID. Returns 0 (1-based
+// would be 1+) when the id isn't one of ours.
+func askOptionIndex(id string) int {
+	var n int
+	if _, err := fmt.Sscanf(id, "opt-%d", &n); err != nil {
+		return 0
+	}
+	return n
+}
+
+// isInterceptedAskToolUseID reports whether toolUseID belongs to an
+// AskUserQuestion tool_use we currently have an open reactions
+// picker for. Used to suppress the SDK's auto-generated error
+// tool_result (it fires in headless mode before the user reacts).
+//
+// O(rooms-with-open-picker). At any moment that's typically zero or
+// one, so a linear scan over pendingAsks is fine.
+func (b *Bridge) isInterceptedAskToolUseID(toolUseID string) bool {
+	if toolUseID == "" {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, pa := range b.pendingAsks {
+		if pa.toolUseID == toolUseID {
+			return true
+		}
+	}
+	return false
+}
+
+
+// handlePollResponse is the org.matrix.msc3381.poll.response handler.
+// Resolves the pending ask in roomID, closes the poll so Element
+// greys out the buttons, and injects the chosen option as a fresh
+// user turn. First valid response wins.
+func (b *Bridge) handlePollResponse(ctx context.Context, roomID id.RoomID, pollStartID id.EventID, sender id.UserID, answerIDs []string) {
+	if len(answerIDs) == 0 {
 		return
 	}
 	if !b.isAllowed(sender) {
 		return
 	}
+	idx := askOptionIndex(answerIDs[0])
+	if idx == 0 {
+		return
+	}
 	b.mu.Lock()
 	pending, ok := b.pendingAsks[roomID]
-	if !ok || pending.eventID != sourceEventID {
+	if !ok || pending.eventID != pollStartID {
 		b.mu.Unlock()
 		return
 	}
@@ -517,24 +580,29 @@ func (b *Bridge) handleReaction(ctx context.Context, roomID id.RoomID, sourceEve
 	chosen := pending.options[idx-1]
 	delete(b.pendingAsks, roomID)
 	b.mu.Unlock()
-	log.Printf("[agent] ask_user resolved in %s: %s → %q", roomID, key, truncate(chosen, 80))
+	log.Printf("[agent] ask_user (poll) resolved in %s: %s → %q", roomID, answerIDs[0], truncate(chosen, 80))
 
-	// Acknowledge the choice visibly so the user sees what was picked
-	// (the reaction click itself is subtle), then enqueue as a turn.
-	_, _ = b.mx.SendText(ctx, roomID, fmt.Sprintf("> %s %s", key, chosen))
+	// Close the poll so Element greys out the buttons and shows the
+	// result; the summary text is the fallback m.text for non-poll-
+	// aware clients.
+	if err := b.mx.SendPollEnd(ctx, roomID, pollStartID, fmt.Sprintf("Poll closed — %s", chosen)); err != nil {
+		log.Printf("[agent] poll.end send failed in %s: %v", roomID, err)
+	}
+
+	// Acknowledge in chat (the vote in Element is visible but quiet),
+	// then enqueue as a fresh user turn. Same downstream path as the
+	// envelope flow.
+	_, _ = b.mx.SendText(ctx, roomID, fmt.Sprintf("> %s", chosen))
 
 	sess := b.getOrCreate(ctx, roomID)
 	if sess == nil || sess.inbox == nil {
-		log.Printf("[agent] ask_user could not enqueue (no inbox) in %s", roomID)
+		log.Printf("[agent] ask_user (poll) could not enqueue (no inbox) in %s", roomID)
 		return
 	}
 	select {
 	case sess.inbox <- turnRequest{sender: sender, text: chosen}:
 	default:
-		// Same swamped-notification policy as the main message path
-		// (#812): silent drops on the reaction path leave the user
-		// staring at a room that never reacts to their click.
-		log.Printf("[agent] ask_user inbox full in %s", roomID)
+		log.Printf("[agent] ask_user (poll) inbox full in %s", roomID)
 		_, _ = b.mx.SendText(context.Background(), roomID, inboxFullMsg)
 	}
 }
@@ -733,12 +801,41 @@ func (b *Bridge) handleMessage(ctx context.Context, im matrix.IncomingMessage) {
 				"详细错见 `~/.mosaic/agent.log`.")
 		return
 	}
+	// A new user turn supersedes any pending poll in this room — close
+	// it so a late accidental vote doesn't inject a stale turn after
+	// the conversation has moved on.
+	b.cancelPendingAsk(context.Background(), roomID, "superseded by new message")
+
 	select {
 	case sess.inbox <- turnRequest{sender: sender, text: text, attachments: im.Attachments}:
 	default:
 		// Buffer full → tell the user we're swamped rather than block
 		// the sync goroutine.
 		_, _ = b.mx.SendText(context.Background(), roomID, inboxFullMsg)
+	}
+}
+
+// cancelPendingAsk closes any open poll/pending-ask in roomID. Drops
+// the in-memory pendingAsks entry first (so the response handler
+// short-circuits on a race), then emits poll.end so Element greys
+// out the buttons. Both steps are best-effort; no-op when there's
+// no pending ask.
+func (b *Bridge) cancelPendingAsk(ctx context.Context, roomID id.RoomID, reason string) {
+	b.mu.Lock()
+	pending, ok := b.pendingAsks[roomID]
+	if ok {
+		delete(b.pendingAsks, roomID)
+	}
+	b.mu.Unlock()
+	if !ok || pending == nil {
+		return
+	}
+	summary := "Poll closed"
+	if reason != "" {
+		summary = "Poll closed — " + reason
+	}
+	if err := b.mx.SendPollEnd(ctx, roomID, pending.eventID, summary); err != nil {
+		log.Printf("[agent] cancelPendingAsk: poll.end failed in %s: %v", roomID, err)
 	}
 }
 
@@ -1985,6 +2082,21 @@ func (t *turn) consume(ctx context.Context, ev runtime.Event) bool {
 		// is preserved.
 		t.finalizeText(ctx, "")
 		t.toolCount++
+		// AskUserQuestion: intercept and render as a native Matrix
+		// poll instead of a plain tool_use bubble. The SDK still
+		// auto-fails the deferred tool with an error tool_result
+		// (suppressed via isInterceptedAskToolUseID); the user's
+		// vote arrives via handlePollResponse and is injected as a
+		// fresh user turn.
+		if e.Name == "AskUserQuestion" {
+			if ask, ok := parseAskUserQuestionTool(e.Input); ok {
+				ask.toolUseID = e.ID
+				t.refreshTypingIfStale(ctx)
+				t.renderAskUser(ctx, ask)
+				return false
+			}
+			log.Printf("[agent] AskUserQuestion tool_use unparseable, falling through to generic render")
+		}
 		if t.b.opts.IgnoreToolsMsg[strings.ToLower(e.Name)] {
 			return false
 		}
@@ -1997,6 +2109,15 @@ func (t *turn) consume(ctx context.Context, ev runtime.Event) bool {
 
 	case runtime.ToolResult:
 		if !e.IsError {
+			return false
+		}
+		// Swallow the SDK's auto-failure of an AskUserQuestion we
+		// intercepted: in headless stream-json mode the SDK falls
+		// back to an error tool_result before the user has any
+		// chance to click a reaction. The user-visible UX is the
+		// reactions picker we rendered alongside the tool_use, and
+		// the model will get a real answer when the user replies.
+		if t.b.isInterceptedAskToolUseID(e.ToolUseID) {
 			return false
 		}
 		name := e.ToolName

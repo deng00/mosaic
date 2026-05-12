@@ -125,11 +125,19 @@ type MessageHandler func(ctx context.Context, msg IncomingMessage)
 // hasn't named it yet). Runs in the sync goroutine — punt long work.
 type SpaceJoinedHandler func(ctx context.Context, parentSpace, newSpace id.RoomID, spaceName string)
 
-// ReactionHandler fires for every inbound m.reaction not sent by the
-// bot. sourceEventID is the message the reaction is attached to;
-// key is the emoji (e.g. "1️⃣" or "👍"). Used by the bridge to wire
-// quick-reply buttons (ask_user → number-emoji reactions).
-type ReactionHandler func(ctx context.Context, roomID id.RoomID, sourceEventID id.EventID, sender id.UserID, key string)
+// PollResponseHandler fires for every inbound org.matrix.msc3381.
+// poll.response event not sent by the bot. pollStartID is the poll
+// start event being voted on; answerIDs is the list of selected
+// option IDs (the bridge sets max_selections=1 today so this is
+// typically one element). Used by the bridge for the ask_user flow.
+type PollResponseHandler func(ctx context.Context, roomID id.RoomID, pollStartID id.EventID, sender id.UserID, answerIDs []string)
+
+// PollAnswer is one option in a poll the bot creates. ID must be
+// unique within the poll; Text is what Element renders on the button.
+type PollAnswer struct {
+	ID   string
+	Text string
+}
 
 // Config bundles everything Login needs.
 type Config struct {
@@ -167,9 +175,9 @@ type Client struct {
 	mediaDir              string
 
 	mu          sync.Mutex
-	handler     MessageHandler
-	spaceJoined SpaceJoinedHandler
-	reaction    ReactionHandler
+	handler      MessageHandler
+	spaceJoined  SpaceJoinedHandler
+	pollResponse PollResponseHandler
 }
 
 // Login logs in (creating a new device if needed), starts the crypto
@@ -275,40 +283,77 @@ func (c *Client) OnSpaceJoined(h SpaceJoinedHandler) {
 	c.spaceJoined = h
 }
 
-// OnReaction registers the inbound reaction handler. Must be called
-// before Sync. The bot's own reactions (added programmatically to its
-// quick-reply messages) are filtered out before reaching h.
-func (c *Client) OnReaction(h ReactionHandler) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.reaction = h
-}
-
 // Redact deletes a message event from the room timeline. Used by
 // the bridge to clean up the "raw streamed text" bubble when the
 // model's reply was nothing but an <ask_user> envelope — the
-// rendered button card is sent as a fresh message and the
-// envelope shouldn't linger above it. Per Matrix spec a user can
-// always redact their own events, so this works even when the bot
-// has PL 0 in the room.
+// rendered poll card is sent as a fresh message and the envelope
+// shouldn't linger above it. Per Matrix spec a user can always
+// redact their own events, so this works even when the bot has
+// PL 0 in the room.
 func (c *Client) Redact(ctx context.Context, roomID id.RoomID, eventID id.EventID, reason string) error {
 	_, err := c.mx.RedactEvent(ctx, roomID, eventID, mautrix.ReqRedact{Reason: reason})
 	return err
 }
 
-// SendReaction posts an m.reaction event from the bot, annotating
-// sourceEventID with key (an emoji string). Used by the bridge to
-// pre-seed quick-reply buttons (1️⃣ 2️⃣ …) on the bot's own
-// "ask_user" message.
-func (c *Client) SendReaction(ctx context.Context, roomID id.RoomID, sourceEventID id.EventID, key string) error {
-	content := event.ReactionEventContent{
-		RelatesTo: event.RelatesTo{
-			Type:    event.RelAnnotation,
-			EventID: sourceEventID,
-			Key:     key,
-		},
+// OnPollResponse registers the inbound poll-response handler. The
+// bot's own responses are filtered out before reaching h. Must be
+// called before Sync.
+func (c *Client) OnPollResponse(h PollResponseHandler) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pollResponse = h
+}
+
+// SendPollStart posts an org.matrix.msc3381.poll.start event (MSC3381
+// unstable namespace — what Element actually consumes today). Element
+// renders this natively as a poll card with click-to-vote buttons.
+// max_selections is hard-coded to 1; ask_user is single-choice today.
+// Returns the new event ID so the caller can later close the poll
+// via SendPollEnd and key state lookups on it.
+func (c *Client) SendPollStart(ctx context.Context, roomID id.RoomID, question string, answers []PollAnswer) (id.EventID, error) {
+	// We assemble the content as map[string]any rather than mautrix's
+	// PollStartEventContent because the latter uses anonymous structs
+	// for the answers list, which makes idiomatic construction painful.
+	// JSON shape is identical either way.
+	answersBlock := make([]map[string]any, 0, len(answers))
+	for _, a := range answers {
+		answersBlock = append(answersBlock, map[string]any{
+			"id":                      a.ID,
+			"org.matrix.msc1767.text": a.Text,
+		})
 	}
-	_, err := c.mx.SendMessageEvent(ctx, roomID, event.EventReaction, content)
+	content := map[string]any{
+		"org.matrix.msc3381.poll.start": map[string]any{
+			"kind":           "org.matrix.msc3381.poll.disclosed",
+			"max_selections": 1,
+			"question":       map[string]any{"org.matrix.msc1767.text": question},
+			"answers":        answersBlock,
+		},
+		// MSC1767 fallback for clients that don't render polls yet —
+		// they see the question text and at least know what was asked.
+		"org.matrix.msc1767.text": question,
+	}
+	resp, err := c.mx.SendMessageEvent(ctx, roomID, event.EventUnstablePollStart, content)
+	if err != nil {
+		return "", err
+	}
+	return resp.EventID, nil
+}
+
+// SendPollEnd posts an org.matrix.msc3381.poll.end event referencing
+// pollStartID. Element greys out the poll card and shows summary
+// counts. summary is the m.text fallback for non-poll-aware clients
+// (e.g. "Poll closed: 火锅").
+func (c *Client) SendPollEnd(ctx context.Context, roomID id.RoomID, pollStartID id.EventID, summary string) error {
+	content := map[string]any{
+		"m.relates_to": map[string]any{
+			"rel_type": "m.reference",
+			"event_id": pollStartID,
+		},
+		"org.matrix.msc3381.poll.end": map[string]any{},
+		"org.matrix.msc1767.text":     summary,
+	}
+	_, err := c.mx.SendMessageEvent(ctx, roomID, event.EventUnstablePollEnd, content)
 	return err
 }
 
@@ -911,29 +956,30 @@ func (c *Client) installHandlers() {
 		h(ctx, im)
 	})
 
-	// m.reaction events — the bot's own reactions are filtered out so
-	// the bridge only sees genuine user clicks on its quick-reply
-	// messages. Spec: ReactionEventContent.RelatesTo.{EventID,Key} are
-	// authoritative; Type is always m.annotation for reactions.
-	syncer.OnEventType(event.EventReaction, func(ctx context.Context, evt *event.Event) {
+	// org.matrix.msc3381.poll.response — Element's native poll vote.
+	// Filter the bot's own votes; require a reference back to the
+	// poll start event. Multiple selections are allowed by spec; we
+	// pass the full list through and let the bridge pick the first
+	// (max_selections is 1 in our polls).
+	syncer.OnEventType(event.EventUnstablePollResponse, func(ctx context.Context, evt *event.Event) {
 		if evt.Sender == c.mx.UserID {
 			return
 		}
-		content := evt.Content.AsReaction()
-		if content == nil {
+		var content event.PollResponseEventContent
+		if err := json.Unmarshal(evt.Content.VeryRaw, &content); err != nil {
 			return
 		}
 		rel := content.RelatesTo
-		if rel.Type != event.RelAnnotation || rel.EventID == "" || rel.Key == "" {
+		if rel.EventID == "" {
 			return
 		}
 		c.mu.Lock()
-		h := c.reaction
+		h := c.pollResponse
 		c.mu.Unlock()
 		if h == nil {
 			return
 		}
-		h(ctx, evt.RoomID, rel.EventID, evt.Sender, rel.Key)
+		h(ctx, evt.RoomID, rel.EventID, evt.Sender, content.Response.Answers)
 	})
 }
 

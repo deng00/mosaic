@@ -15,22 +15,19 @@ import (
 // FormatToolUse renders one tool_use block as a single short markdown
 // line suitable for sending as its own Matrix message. Falls back to
 // "🔧 ToolName" if the input doesn't deserialize.
+//
+// House style: the tool name (bold + emoji) sits on its own line; the
+// arguments / payload go on the line below. goldmark has HardWraps
+// off, so the break is encoded as two trailing spaces + newline
+// (markdown hard break) — see pkg/matrix/client.go:38.
 func FormatToolUse(name string, input json.RawMessage) string {
 	switch name {
 	case "Bash":
 		var v struct {
-			Command     string `json:"command"`
-			Description string `json:"description"`
+			Command string `json:"command"`
 		}
 		_ = json.Unmarshal(input, &v)
-		body := "🛠️ **Bash** `" + truncate(oneLine(v.Command), 200) + "`"
-		if v.Description != "" {
-			// Two trailing spaces + newline = markdown hard line break;
-			// description (description, not command) lands on its own
-			// line so it doesn't read as part of the shell input.
-			body += "  \n_" + truncate(v.Description, 80) + "_"
-		}
-		return body
+		return "🛠️ **Bash**  \n`" + truncate(oneLine(v.Command), 200) + "`"
 
 	case "Read":
 		var v struct {
@@ -43,7 +40,7 @@ func FormatToolUse(name string, input json.RawMessage) string {
 		if v.Limit > 0 {
 			extra = fmt.Sprintf(" (lines %d–%d)", v.Offset+1, v.Offset+v.Limit)
 		}
-		return "📖 **Read** `" + relPath(v.FilePath) + "`" + extra
+		return "📖 **Read**  \n`" + relPath(v.FilePath) + "`" + extra
 
 	case "Write":
 		var v struct {
@@ -51,7 +48,7 @@ func FormatToolUse(name string, input json.RawMessage) string {
 			Content  string `json:"content"`
 		}
 		_ = json.Unmarshal(input, &v)
-		return fmt.Sprintf("📝 **Write** `%s` (%d B)", relPath(v.FilePath), len(v.Content))
+		return fmt.Sprintf("📝 **Write**  \n`%s` (%d B)", relPath(v.FilePath), len(v.Content))
 
 	case "Edit":
 		var v struct {
@@ -65,7 +62,7 @@ func FormatToolUse(name string, input json.RawMessage) string {
 		if v.ReplaceAll {
 			marker = " (replace_all)"
 		}
-		return fmt.Sprintf("✏️ **Edit** `%s`%s\n```diff\n%s%s```",
+		return fmt.Sprintf("✏️ **Edit**  \n`%s`%s\n```diff\n%s%s```",
 			relPath(v.FilePath), marker,
 			diffLines("-", v.OldString, 20, 200),
 			diffLines("+", v.NewString, 20, 200))
@@ -85,7 +82,7 @@ func FormatToolUse(name string, input json.RawMessage) string {
 		if v.Glob != "" {
 			where += " glob=`" + v.Glob + "`"
 		}
-		return fmt.Sprintf("🔎 **Grep** `%s`%s", truncate(v.Pattern, 80), where)
+		return fmt.Sprintf("🔎 **Grep**  \n`%s`%s", truncate(v.Pattern, 80), where)
 
 	case "Glob":
 		var v struct {
@@ -97,7 +94,7 @@ func FormatToolUse(name string, input json.RawMessage) string {
 		if v.Path != "" {
 			where = " in `" + relPath(v.Path) + "`"
 		}
-		return "🔭 **Glob** `" + v.Pattern + "`" + where
+		return "🔭 **Glob**  \n`" + v.Pattern + "`" + where
 
 	case "Agent":
 		var v struct {
@@ -105,7 +102,7 @@ func FormatToolUse(name string, input json.RawMessage) string {
 			SubagentType string `json:"subagent_type"`
 		}
 		_ = json.Unmarshal(input, &v)
-		return fmt.Sprintf("🤖 **Agent** _%s_ — %s",
+		return fmt.Sprintf("🤖 **Agent**  \n_%s_ — %s",
 			defaultStr(v.SubagentType, "general"),
 			truncate(v.Description, 120))
 
@@ -124,7 +121,7 @@ func FormatToolUse(name string, input json.RawMessage) string {
 		}
 		_ = json.Unmarshal(input, &v)
 		if len(v.Todos) == 0 {
-			return "📋 **TodoWrite** _(empty)_"
+			return "📋 **TodoWrite**  \n_(empty)_"
 		}
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "📋 **TodoWrite** (%d)\n", len(v.Todos))
@@ -146,27 +143,22 @@ func FormatToolUse(name string, input json.RawMessage) string {
 
 	case "WebFetch":
 		var v struct {
-			URL    string `json:"url"`
-			Prompt string `json:"prompt"`
+			URL string `json:"url"`
 		}
 		_ = json.Unmarshal(input, &v)
-		body := "🌐 **WebFetch** " + v.URL
-		if v.Prompt != "" {
-			body += "  \n_" + truncate(oneLine(v.Prompt), 200) + "_"
-		}
-		return body
+		return "🌐 **WebFetch**  \n" + v.URL
 
 	case "WebSearch":
 		var v struct {
 			Query string `json:"query"`
 		}
 		_ = json.Unmarshal(input, &v)
-		return "🔍 **WebSearch** `" + truncate(v.Query, 120) + "`"
+		return "🔍 **WebSearch**  \n`" + truncate(v.Query, 120) + "`"
 
 	default:
 		// Unknown tool: show name and a tiny preview of input.
 		preview := truncate(oneLine(string(input)), 100)
-		return fmt.Sprintf("🔧 **%s** `%s`", name, preview)
+		return fmt.Sprintf("🔧 **%s**  \n`%s`", name, preview)
 	}
 }
 
