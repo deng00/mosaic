@@ -10,10 +10,14 @@ package claude
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/deng00/mosaic/pkg/claude/streamjson"
@@ -55,7 +59,13 @@ func (driver) Spawn(ctx context.Context, opts runtime.Options) (runtime.Process,
 	if err != nil {
 		return nil, err
 	}
-	p := &process{sj: sj, events: make(chan runtime.Event, 32)}
+	p := &process{
+		sj:            sj,
+		events:        make(chan runtime.Event, 32),
+		cwd:           opts.Cwd,
+		pendingWrites: map[string]string{},
+		emittedPaths:  map[string]bool{},
+	}
 	go p.pump()
 	return p, nil
 }
@@ -63,6 +73,21 @@ func (driver) Spawn(ctx context.Context, opts runtime.Options) (runtime.Process,
 type process struct {
 	sj     *streamjson.Process
 	events chan runtime.Event
+
+	// cwd is the absolute working directory of this session. Used to
+	// constrain path-based image detection: only files under cwd are
+	// candidates so we never surface arbitrary host files.
+	cwd string
+
+	// pendingWrites maps tool_use_id → file path for in-flight Write
+	// calls that target an image extension. Cleared once the matching
+	// tool_result (success) emits an ImageFinal, or replaced/dropped
+	// on overwrite.
+	mu            sync.Mutex
+	pendingWrites map[string]string
+	// emittedPaths dedupes ImageFinal per path within this process
+	// lifetime — Claude often re-mentions paths across turns.
+	emittedPaths map[string]bool
 }
 
 func (p *process) Send(msg runtime.Message) error {
@@ -114,7 +139,7 @@ func (p *process) Close() error { return p.sj.Close(2 * time.Second) }
 func (p *process) pump() {
 	defer close(p.events)
 	for raw := range p.sj.Events() {
-		for _, ev := range translate(raw) {
+		for _, ev := range p.translate(raw) {
 			p.events <- ev
 		}
 	}
@@ -125,17 +150,22 @@ func (p *process) pump() {
 //
 //	stream_event content_block_delta text_delta → TextDelta
 //	assistant.content[].type:
-//	  text     → TextFinal (canonical)
+//	  text     → TextFinal (canonical) + ImageFinal for any
+//	             image paths under cwd that exist on disk
 //	  thinking → Thinking
-//	  tool_use → ToolUse
+//	  tool_use → ToolUse; Write/Edit with image extension is
+//	             remembered for ImageFinal-on-success below
 //	user.content[].type:
 //	  tool_result with is_error → ToolResult
+//	  tool_result success → ImageFinal for the remembered Write
+//	                        path, plus any embedded image content
+//	                        blocks (base64 → temp file)
 //	system subtype:init → SessionInfo
 //	result               → TurnDone (Reason from subtype)
 //
 // Anything else is silently dropped — the bridge cares only about
 // what should reach the chat timeline.
-func translate(raw json.RawMessage) []runtime.Event {
+func (p *process) translate(raw json.RawMessage) []runtime.Event {
 	var head struct {
 		Type    string `json:"type"`
 		Subtype string `json:"subtype"`
@@ -183,6 +213,9 @@ func translate(raw json.RawMessage) []runtime.Event {
 			switch blk.Type {
 			case "text":
 				out = append(out, runtime.TextFinal{Body: blk.Text})
+				for _, img := range p.scanTextForImages(blk.Text) {
+					out = append(out, img)
+				}
 			case "thinking":
 				out = append(out, runtime.Thinking{Text: blk.Text})
 			case "tool_use":
@@ -191,6 +224,7 @@ func translate(raw json.RawMessage) []runtime.Event {
 					Name:  blk.Name,
 					Input: blk.Input,
 				})
+				p.recordPendingWrite(blk.ID, blk.Name, blk.Input)
 			}
 		}
 		return out
@@ -215,12 +249,27 @@ func translate(raw json.RawMessage) []runtime.Event {
 		}
 		out := make([]runtime.Event, 0)
 		for _, blk := range blocks {
-			if blk.Type == "tool_result" && blk.IsError {
+			if blk.Type != "tool_result" {
+				continue
+			}
+			if blk.IsError {
+				p.forgetPendingWrite(blk.ToolUseID)
 				out = append(out, runtime.ToolResult{
 					ToolUseID: blk.ToolUseID,
 					Content:   blk.Content,
 					IsError:   true,
 				})
+				continue
+			}
+			// Success: resolve any pending Write/Edit that targeted an
+			// image path, and harvest any embedded image content blocks.
+			if path := p.takePendingWrite(blk.ToolUseID); path != "" {
+				if img, ok := p.maybeEmitImage(path, ""); ok {
+					out = append(out, img)
+				}
+			}
+			for _, img := range p.extractToolResultImages(blk.Content) {
+				out = append(out, img)
 			}
 		}
 		return out
@@ -257,4 +306,229 @@ func translate(raw json.RawMessage) []runtime.Event {
 		return []runtime.Event{td}
 	}
 	return nil
+}
+
+// imageExt is the set of file extensions we surface as m.image.
+// SVG intentionally included — Element renders it fine and it's a
+// common output of charting / diagram tools.
+var imageExt = map[string]string{
+	".png":  "image/png",
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".gif":  "image/gif",
+	".webp": "image/webp",
+	".svg":  "image/svg+xml",
+}
+
+// pathPattern matches absolute or ~-prefixed paths ending in an
+// image extension. Used to harvest image paths from the assistant's
+// prose ("saved chart to /tmp/foo.png"). Conservative on purpose —
+// only paths starting with `/` or `~/` are considered, so URLs and
+// in-prose filenames without a parent component are skipped.
+var pathPattern = regexp.MustCompile(`(?:~|/)[^\s'"\x60()<>]*\.(?:png|jpe?g|gif|webp|svg)\b`)
+
+// scanTextForImages pulls image file paths out of an assistant text
+// block. Each unique resolvable path that exists on disk and sits
+// under the session cwd becomes one ImageFinal event. Out-of-tree
+// paths are dropped — we never want to leak arbitrary host files
+// just because the model mentioned one.
+func (p *process) scanTextForImages(text string) []runtime.Event {
+	if p.cwd == "" || text == "" {
+		return nil
+	}
+	matches := pathPattern.FindAllString(text, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	var out []runtime.Event
+	for _, m := range matches {
+		if ev, ok := p.maybeEmitImage(m, ""); ok {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+// recordPendingWrite is called for every assistant tool_use block.
+// When the tool is Write / Edit / NotebookEdit (the file-mutating
+// builtins) and the target file_path ends in an image extension, we
+// remember it so the corresponding tool_result can emit ImageFinal
+// on success.
+func (p *process) recordPendingWrite(toolUseID, name string, input json.RawMessage) {
+	if toolUseID == "" {
+		return
+	}
+	switch name {
+	case "Write", "Edit", "NotebookEdit":
+	default:
+		return
+	}
+	var in struct {
+		FilePath string `json:"file_path"`
+	}
+	if err := json.Unmarshal(input, &in); err != nil || in.FilePath == "" {
+		return
+	}
+	if _, ok := imageExt[strings.ToLower(filepath.Ext(in.FilePath))]; !ok {
+		return
+	}
+	p.mu.Lock()
+	p.pendingWrites[toolUseID] = in.FilePath
+	p.mu.Unlock()
+}
+
+func (p *process) takePendingWrite(toolUseID string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	path := p.pendingWrites[toolUseID]
+	delete(p.pendingWrites, toolUseID)
+	return path
+}
+
+func (p *process) forgetPendingWrite(toolUseID string) {
+	p.mu.Lock()
+	delete(p.pendingWrites, toolUseID)
+	p.mu.Unlock()
+}
+
+// maybeEmitImage validates path (image extension, exists, under cwd,
+// not already emitted) and returns an ImageFinal event when all
+// checks pass. mimeOverride is used when the caller already knows
+// the type (e.g. derived from a base64 tool_result block).
+func (p *process) maybeEmitImage(path, mimeOverride string) (runtime.ImageFinal, bool) {
+	abs := expandPath(path)
+	if !filepath.IsAbs(abs) {
+		// Resolve relative to cwd. Bare "foo.png" is rare in real
+		// model output; we still accept it because Write+Edit can
+		// emit relative paths.
+		if p.cwd == "" {
+			return runtime.ImageFinal{}, false
+		}
+		abs = filepath.Join(p.cwd, abs)
+	}
+	abs = filepath.Clean(abs)
+	mime, ok := imageExt[strings.ToLower(filepath.Ext(abs))]
+	if !ok {
+		return runtime.ImageFinal{}, false
+	}
+	if mimeOverride != "" {
+		mime = mimeOverride
+	}
+	if p.cwd != "" {
+		rel, err := filepath.Rel(p.cwd, abs)
+		if err != nil || strings.HasPrefix(rel, "..") {
+			// Outside cwd → refuse, regardless of file existence.
+			return runtime.ImageFinal{}, false
+		}
+	}
+	info, err := os.Stat(abs)
+	if err != nil || info.IsDir() || info.Size() == 0 {
+		return runtime.ImageFinal{}, false
+	}
+	p.mu.Lock()
+	if p.emittedPaths[abs] {
+		p.mu.Unlock()
+		return runtime.ImageFinal{}, false
+	}
+	p.emittedPaths[abs] = true
+	p.mu.Unlock()
+	return runtime.ImageFinal{Path: abs, MimeType: mime}, true
+}
+
+// expandPath rewrites a leading "~" / "~/" to the user's home dir.
+// Unknown forms (~user) are left untouched.
+func expandPath(p string) string {
+	if !strings.HasPrefix(p, "~") {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return p
+	}
+	if p == "~" {
+		return home
+	}
+	if strings.HasPrefix(p, "~/") {
+		return filepath.Join(home, p[2:])
+	}
+	return p
+}
+
+// extractToolResultImages pulls inline image blocks out of a
+// tool_result content payload. Two shapes are common:
+//   - the whole content is a JSON-string (Bash stdout) → no images
+//   - the content is an array of {type:"text"|"image",...} blocks →
+//     decode base64 image blocks to a temp file and emit ImageFinal.
+//
+// We write decoded bytes to os.TempDir() (not cwd) because tool-
+// returned screenshots aren't workspace artefacts. The bridge takes
+// it from there.
+func (p *process) extractToolResultImages(content json.RawMessage) []runtime.Event {
+	if len(content) == 0 || content[0] != '[' {
+		return nil
+	}
+	var blocks []struct {
+		Type   string `json:"type"`
+		Source struct {
+			Type      string `json:"type"`
+			MediaType string `json:"media_type"`
+			Data      string `json:"data"`
+		} `json:"source"`
+	}
+	if err := json.Unmarshal(content, &blocks); err != nil {
+		return nil
+	}
+	var out []runtime.Event
+	for _, b := range blocks {
+		if b.Type != "image" || b.Source.Type != "base64" || b.Source.Data == "" {
+			continue
+		}
+		mime := b.Source.MediaType
+		ext := extFromMime(mime)
+		if ext == "" {
+			continue
+		}
+		data, err := base64.StdEncoding.DecodeString(b.Source.Data)
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		f, err := os.CreateTemp("", "mosaic-img-*"+ext)
+		if err != nil {
+			continue
+		}
+		if _, err := f.Write(data); err != nil {
+			_ = f.Close()
+			_ = os.Remove(f.Name())
+			continue
+		}
+		_ = f.Close()
+		p.mu.Lock()
+		if p.emittedPaths[f.Name()] {
+			p.mu.Unlock()
+			_ = os.Remove(f.Name())
+			continue
+		}
+		p.emittedPaths[f.Name()] = true
+		p.mu.Unlock()
+		out = append(out, runtime.ImageFinal{Path: f.Name(), MimeType: mime})
+	}
+	return out
+}
+
+// extFromMime mirrors matrix/client.go but is local to keep
+// dependencies one-way (driver shouldn't import matrix).
+func extFromMime(mime string) string {
+	switch mime {
+	case "image/png":
+		return ".png"
+	case "image/jpeg", "image/jpg":
+		return ".jpg"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	case "image/svg+xml":
+		return ".svg"
+	}
+	return ""
 }

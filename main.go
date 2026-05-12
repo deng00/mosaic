@@ -33,6 +33,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -263,6 +264,7 @@ func runBot(ctx context.Context, fc *FileConfig, bc BotConfig, mgr *AgentRuntime
 		Members:        fc.Members,
 		ServerName:     fc.ServerName,
 		Env:            bc.Env,
+		IgnoreToolsMsg: resolveIgnoreToolsMsg(bc.IgnoreToolsMsg),
 	})
 	if mgr != nil {
 		mgr.trackBridge(bc.ID, br)
@@ -405,4 +407,28 @@ func must(k string) string {
 		os.Exit(2)
 	}
 	return v
+}
+
+// defaultIgnoreToolsMsg is the per-agent built-in list of tool names
+// whose ToolUse messages aren't relayed into the room — the noisy
+// internal-housekeeping tools that don't help the user follow along.
+var defaultIgnoreToolsMsg = []string{"Grep", "Read", "Write", "ToolSearch"}
+
+// resolveIgnoreToolsMsg turns the YAML field (nil = use defaults,
+// explicit list = use as-is, including empty for "no filter") into the
+// lower-cased lookup set the bridge consumes.
+func resolveIgnoreToolsMsg(cfg *[]string) map[string]bool {
+	src := defaultIgnoreToolsMsg
+	if cfg != nil {
+		src = *cfg
+	}
+	out := make(map[string]bool, len(src))
+	for _, name := range src {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		out[strings.ToLower(name)] = true
+	}
+	return out
 }

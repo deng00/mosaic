@@ -136,6 +136,14 @@ type BotConfig struct {
 	// runtime subprocess. Useful for CLAUDE_CODE_OAUTH_TOKEN etc.
 	Env map[string]string `yaml:"env,omitempty"`
 
+	// IgnoreToolsMsg lists tool names whose ToolUse invocation
+	// messages are silently dropped (not relayed into the room).
+	// Matched case-insensitively against the runtime tool name
+	// (Bash / Read / Grep / …). nil/unset = apply the daemon default
+	// (Grep, Read, Write, ToolSearch). An explicit empty list in
+	// YAML (`ignore_tools_msg: []`) disables filtering entirely.
+	IgnoreToolsMsg *[]string `yaml:"ignore_tools_msg,omitempty"`
+
 	// --- Runtime-specific sub-blocks ---
 	// Only the block matching Runtime is consulted; others are
 	// silently ignored (kept around so a user can switch Runtime

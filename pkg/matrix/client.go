@@ -26,6 +26,7 @@ import (
 	"github.com/yuin/goldmark/extension"
 	"github.com/yuin/goldmark/renderer/html"
 	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/crypto/attachment"
 	"maunium.net/go/mautrix/crypto/cryptohelper"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
@@ -102,6 +103,12 @@ type IncomingMessage struct {
 	Sender      id.UserID
 	Text        string
 	Attachments []Attachment
+
+	// Mentions is the explicit `m.mentions.user_ids` list, when present
+	// on the event. Element / mautrix populate it when the sender uses
+	// the autocomplete pill; plain-text `@localpart` typed by hand is
+	// NOT in here — callers that care must also parse the body.
+	Mentions []id.UserID
 }
 
 // MessageHandler is invoked for every inbound user message (text or
@@ -417,6 +424,23 @@ func (c *Client) HasJoinedRoom(ctx context.Context, roomID id.RoomID) bool {
 	return ok
 }
 
+// JoinedMemberSet returns the set of currently-joined user ids in
+// roomID. Wraps the `/joined_members` API. Used by the bridge to
+// decide if a room is "single-agent" (only one of our fleet present →
+// broadcast mode) vs "multi-agent" (require explicit @-mention to
+// respond).
+func (c *Client) JoinedMemberSet(ctx context.Context, roomID id.RoomID) (map[id.UserID]bool, error) {
+	resp, err := c.mx.JoinedMembers(ctx, roomID)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[id.UserID]bool, len(resp.Joined))
+	for uid := range resp.Joined {
+		out[uid] = true
+	}
+	return out, nil
+}
+
 // MyPowerLevel reports the bot's PL in roomID by reading m.room.power_levels.
 // Returns the per-user value if listed; otherwise users_default; 0 on error
 // (treat unknown as no privilege — callers gate behaviour on >= 50).
@@ -648,7 +672,19 @@ func (c *Client) Typing(ctx context.Context, roomID id.RoomID, on bool, timeoutM
 // HTML formatted_body so Element renders it richly. Returns the event
 // ID so the caller can edit it later for streaming.
 func (c *Client) SendText(ctx context.Context, roomID id.RoomID, body string) (id.EventID, error) {
+	return c.SendTextMentions(ctx, roomID, body, nil)
+}
+
+// SendTextMentions is like SendText but populates the protocol-level
+// m.mentions.user_ids field. Required for peer agents to recognise
+// the message as an intentional ping (their router only trusts
+// m.mentions for bot-to-bot dispatch). Pass nil/empty for normal
+// (non-pinging) sends.
+func (c *Client) SendTextMentions(ctx context.Context, roomID id.RoomID, body string, mentions []id.UserID) (id.EventID, error) {
 	content := buildTextContent(body)
+	if len(mentions) > 0 {
+		content.Mentions = &event.Mentions{UserIDs: mentions}
+	}
 	resp, err := c.mx.SendMessageEvent(ctx, roomID, event.EventMessage, content)
 	if err != nil {
 		return "", err
@@ -661,7 +697,20 @@ func (c *Client) SendText(ctx context.Context, roomID id.RoomID, body string) (i
 // Element renders this as the original event with "(edited)" tag and
 // the new body inline. Markdown handling matches SendText.
 func (c *Client) EditText(ctx context.Context, roomID id.RoomID, origEventID id.EventID, body string) error {
+	return c.EditTextMentions(ctx, roomID, origEventID, body, nil)
+}
+
+// EditTextMentions is like EditText but propagates m.mentions on the
+// new-content envelope. Note Element silently swallows edits when
+// computing notifications, so this is mostly cosmetic — what matters
+// for peer routing is that the INITIAL send carried the mention.
+// Streaming agent output should still call this so post-merge text
+// records the final mention set accurately.
+func (c *Client) EditTextMentions(ctx context.Context, roomID id.RoomID, origEventID id.EventID, body string, mentions []id.UserID) error {
 	inner := buildTextContent(body)
+	if len(mentions) > 0 {
+		inner.Mentions = &event.Mentions{UserIDs: mentions}
+	}
 	outer := buildTextContent("* " + body) // fallback for clients that don't render edits
 	outer.NewContent = inner
 	outer.RelatesTo = &event.RelatesTo{
@@ -670,6 +719,92 @@ func (c *Client) EditText(ctx context.Context, roomID id.RoomID, origEventID id.
 	}
 	_, err := c.mx.SendMessageEvent(ctx, roomID, event.EventMessage, outer)
 	return err
+}
+
+// SendImage uploads localPath to the homeserver's media repo and
+// posts an m.image event into roomID. Detects whether the room is
+// encrypted and follows the EncryptedFileInfo path when so; otherwise
+// publishes a plaintext mxc:// URL. mimeType is best-effort — if
+// empty, sniff from the first 512 bytes. Caption goes into the body
+// (also the plaintext fallback for non-image clients); empty caption
+// falls back to the file's basename.
+//
+// Returns the new event ID on success. Errors do NOT include
+// homeserver-side rate-limit retries — callers (the bridge) should
+// log + skip.
+func (c *Client) SendImage(ctx context.Context, roomID id.RoomID, localPath, mimeType, caption string) (id.EventID, error) {
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		return "", fmt.Errorf("matrix: read image %s: %w", localPath, err)
+	}
+	if len(data) == 0 {
+		return "", fmt.Errorf("matrix: image %s is empty", localPath)
+	}
+	if mimeType == "" {
+		probe := data
+		if len(probe) > 512 {
+			probe = probe[:512]
+		}
+		mimeType = http.DetectContentType(probe)
+	}
+	filename := filepath.Base(localPath)
+	body := caption
+	if body == "" {
+		body = filename
+	}
+
+	encrypted, _ := c.roomEncrypted(ctx, roomID)
+
+	content := &event.MessageEventContent{
+		MsgType: event.MsgImage,
+		Body:    body,
+		Info: &event.FileInfo{
+			MimeType: mimeType,
+			Size:     len(data),
+		},
+	}
+
+	if encrypted {
+		ef := attachment.NewEncryptedFile()
+		cipher := ef.Encrypt(data)
+		resp, err := c.mx.UploadBytesWithName(ctx, cipher, "application/octet-stream", filename)
+		if err != nil {
+			return "", fmt.Errorf("matrix: upload encrypted image: %w", err)
+		}
+		fi := &event.EncryptedFileInfo{EncryptedFile: *ef}
+		fi.URL = resp.ContentURI.CUString()
+		content.File = fi
+	} else {
+		resp, err := c.mx.UploadBytesWithName(ctx, data, mimeType, filename)
+		if err != nil {
+			return "", fmt.Errorf("matrix: upload image: %w", err)
+		}
+		content.URL = resp.ContentURI.CUString()
+	}
+
+	out, err := c.mx.SendMessageEvent(ctx, roomID, event.EventMessage, content)
+	if err != nil {
+		return "", fmt.Errorf("matrix: send m.image: %w", err)
+	}
+	return out.EventID, nil
+}
+
+// roomEncrypted reports whether roomID has an m.room.encryption
+// state event set. Prefers the client's state store (populated by
+// the sync loop) and falls back to a direct StateEvent probe so a
+// freshly-joined room not yet seen in /sync still gets the right
+// answer.
+func (c *Client) roomEncrypted(ctx context.Context, roomID id.RoomID) (bool, error) {
+	if c.mx.StateStore != nil {
+		if enc, err := c.mx.StateStore.IsEncrypted(ctx, roomID); err == nil && enc {
+			return true, nil
+		}
+	}
+	var content event.EncryptionEventContent
+	if err := c.mx.StateEvent(ctx, roomID, event.StateEncryption, "", &content); err != nil {
+		return false, nil
+	}
+	return content.Algorithm != "", nil
 }
 
 // buildTextContent fills body + (optional) formatted_body for an
@@ -780,6 +915,9 @@ func (c *Client) installHandlers() {
 			RoomID:  evt.RoomID,
 			EventID: evt.ID,
 			Sender:  evt.Sender,
+		}
+		if msg.Mentions != nil {
+			im.Mentions = msg.Mentions.UserIDs
 		}
 
 		switch msg.MsgType {

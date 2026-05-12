@@ -46,6 +46,20 @@ type ToolResult struct {
 	IsError   bool
 }
 
+// ImageFinal surfaces an image produced by the runtime that the
+// bridge should upload as an m.image into the room. Path is an
+// absolute local file path that the runtime guarantees exists at
+// emit time; MimeType is best-effort (drivers may leave it empty
+// and rely on the bridge sniffing). Caption optionally accompanies
+// the image as the m.image body / fallback text. Drivers should
+// emit at most one ImageFinal per generated artefact — duplicate
+// emissions will appear as multiple uploads.
+type ImageFinal struct {
+	Path     string
+	MimeType string
+	Caption  string
+}
+
 // SessionInfo carries the runtime-assigned session/thread id
 // captured from the first event of a fresh spawn. Bridge persists
 // this for later --resume.
@@ -69,5 +83,6 @@ func (TextFinal) isEvent()   {}
 func (Thinking) isEvent()    {}
 func (ToolUse) isEvent()     {}
 func (ToolResult) isEvent()  {}
+func (ImageFinal) isEvent()  {}
 func (SessionInfo) isEvent() {}
 func (TurnDone) isEvent()    {}

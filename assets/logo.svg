@@ -1,0 +1,24 @@
+<svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Mosaic">
+  <!-- container -->
+  <rect width="1024" height="1024" rx="220" fill="#0B1220"/>
+
+  <!-- 4x4 grid: cell=200, gap=20, origin=82 -->
+  <!-- A: r0-1 c0-1  (2x2) -->
+  <rect x="82"  y="82"  width="420" height="420" rx="36" fill="#6366F1"/>
+  <!-- B: r0 c2 -->
+  <rect x="522" y="82"  width="200" height="200" rx="24" fill="#22D3EE"/>
+  <!-- C: r0 c3 (focal — amber) -->
+  <rect x="742" y="82"  width="200" height="200" rx="24" fill="#F59E0B"/>
+  <!-- D: r1-2 c2-3  (2x2) -->
+  <rect x="522" y="302" width="420" height="420" rx="36" fill="#8B5CF6"/>
+  <!-- E: r2 c0-1  (1x2 horizontal bar, dark) -->
+  <rect x="82"  y="522" width="420" height="200" rx="24" fill="#1E293B"/>
+  <!-- F: r3 c0 -->
+  <rect x="82"  y="742" width="200" height="200" rx="24" fill="#A78BFA"/>
+  <!-- G: r3 c1 -->
+  <rect x="302" y="742" width="200" height="200" rx="24" fill="#10B981"/>
+  <!-- H: r3 c2 -->
+  <rect x="522" y="742" width="200" height="200" rx="24" fill="#EC4899"/>
+  <!-- I: r3 c3 -->
+  <rect x="742" y="742" width="200" height="200" rx="24" fill="#3B82F6"/>
+</svg>

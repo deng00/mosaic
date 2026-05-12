@@ -18,6 +18,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -113,6 +114,12 @@ type Options struct {
 	// claude subprocess. Useful for CLAUDE_CODE_OAUTH_TOKEN etc.
 	Env map[string]string
 
+	// IgnoreToolsMsg is the set of tool names whose ToolUse events
+	// the bridge should drop silently (not post into the room).
+	// Keys are lower-cased; the daemon resolves config defaults
+	// before building Options.
+	IgnoreToolsMsg map[string]bool
+
 	// ServerName is our own Matrix server (e.g. "localhost"). Used
 	// to fold the `:server` suffix off displayed room/user IDs that
 	// belong to us — purely a UI sweetener.
@@ -129,7 +136,26 @@ type Bridge struct {
 	resolutions    map[id.RoomID]resolution // cache of room → cwd/model/space
 	pendingCompact map[id.RoomID]bool       // rooms whose next-completed turn should be saved as SUMMARY.md
 	pendingAsks    map[id.RoomID]*pendingAsk // latest open ask_user prompt per room
+
+	// membershipCache memoises `/joined_members` per room so routing
+	// decisions don't pay a homeserver round-trip per inbound message.
+	// 5-minute TTL trades off responsiveness for cost — room
+	// membership changes infrequently and the worst-case error is a
+	// brief mis-classification (broadcast vs targeted) until refresh.
+	membershipCache map[id.RoomID]*membershipEntry
 }
+
+type membershipEntry struct {
+	members map[id.UserID]bool
+	fetched time.Time
+}
+
+const membershipTTL = 5 * time.Minute
+
+// inboxFullMsg is the user-facing notice when a per-room dispatch
+// inbox can't accept a new turnRequest. Shown in both the main message
+// path and the ask_user reaction path so behaviour stays consistent.
+const inboxFullMsg = "⏳ 排队太多了，暂时无法接收。请稍候再试。"
 
 // pendingAsk tracks an open <ask_user> question awaiting a number-emoji
 // reaction. eventID is the Matrix message the bot pre-seeded with
@@ -145,12 +171,13 @@ func New(mx *matrix.Client, opts Options) *Bridge {
 		opts.FlushInterval = 200 * time.Millisecond
 	}
 	return &Bridge{
-		mx:             mx,
-		opts:           opts,
-		sessions:       make(map[id.RoomID]*roomSession),
-		resolutions:    make(map[id.RoomID]resolution),
-		pendingCompact: make(map[id.RoomID]bool),
-		pendingAsks:    make(map[id.RoomID]*pendingAsk),
+		mx:              mx,
+		opts:            opts,
+		sessions:        make(map[id.RoomID]*roomSession),
+		resolutions:     make(map[id.RoomID]resolution),
+		pendingCompact:  make(map[id.RoomID]bool),
+		pendingAsks:     make(map[id.RoomID]*pendingAsk),
+		membershipCache: make(map[id.RoomID]*membershipEntry),
 	}
 }
 
@@ -595,7 +622,11 @@ func (b *Bridge) handleReaction(ctx context.Context, roomID id.RoomID, sourceEve
 	select {
 	case sess.inbox <- turnRequest{sender: sender, text: chosen}:
 	default:
+		// Same swamped-notification policy as the main message path
+		// (#812): silent drops on the reaction path leave the user
+		// staring at a room that never reacts to their click.
 		log.Printf("[agent] ask_user inbox full in %s", roomID)
+		_, _ = b.mx.SendText(context.Background(), roomID, inboxFullMsg)
 	}
 }
 
@@ -723,6 +754,15 @@ func (b *Bridge) handleMessage(ctx context.Context, im matrix.IncomingMessage) {
 		log.Printf("[agent] %s in %s: %s", sender, roomID, truncate(text, 80))
 	}
 
+	// Multi-agent routing: in a room with several agents, route by
+	// @-mention. If the user explicitly @'d another agent, this one
+	// stays silent; if the sender is a peer agent, stay silent unless
+	// they @'d us. No mention at all ⇒ broadcast (each agent responds).
+	if skip, reason := b.shouldIgnoreForRouting(roomID, im); skip {
+		log.Printf("[agent] %s skip in %s: %s", FoldHomeServer(string(b.mx.UserID()), b.opts.ServerName), roomID, reason)
+		return
+	}
+
 	// /unarchive is the only thing honored when archived; everything
 	// else (claude turns, other slashes) gets bounced with a hint.
 	if b.opts.Sessions != nil && b.opts.Sessions.IsArchived(string(roomID)) {
@@ -749,11 +789,17 @@ func (b *Bridge) handleMessage(ctx context.Context, im matrix.IncomingMessage) {
 	// gate so a stranger can at least see they're not authorized.
 	if !b.isAllowed(sender) && !(isSlash && isReadOnlySlash(dispatch)) {
 		log.Printf("[agent] denied: %s (not in admins/members)", sender)
-		_, _ = b.mx.SendText(context.Background(), roomID, fmt.Sprintf(
-			"🔒 你（%s）不在本 agent 的访问名单。请联系管理员（%s）加白：`/agent allow %s`",
-			FoldHomeServer(string(sender), b.opts.ServerName),
-			strings.Join(b.opts.Admins, ", "),
-			FoldHomeServer(string(sender), b.opts.ServerName)))
+		// Belt-and-suspenders: never reply to a peer agent. The mention
+		// router above should already drop these, but if it ever fails
+		// open (e.g. Manager.List empty during startup) the denial reply
+		// becomes ping-pong fuel between two unallowlisted bots.
+		if !b.isPeerAgent(sender) {
+			_, _ = b.mx.SendText(context.Background(), roomID, fmt.Sprintf(
+				"🔒 你（%s）不在本 agent 的访问名单。请联系管理员（%s）加白：`/agent allow %s`",
+				FoldHomeServer(string(sender), b.opts.ServerName),
+				strings.Join(b.opts.Admins, ", "),
+				FoldHomeServer(string(sender), b.opts.ServerName)))
+		}
 		return
 	}
 
@@ -783,8 +829,7 @@ func (b *Bridge) handleMessage(ctx context.Context, im matrix.IncomingMessage) {
 	default:
 		// Buffer full → tell the user we're swamped rather than block
 		// the sync goroutine.
-		_, _ = b.mx.SendText(context.Background(), roomID,
-			"⏳ 排队太多了，暂时无法接收。请稍候再试。")
+		_, _ = b.mx.SendText(context.Background(), roomID, inboxFullMsg)
 	}
 }
 
@@ -1038,9 +1083,12 @@ func (b *Bridge) isAdmin(sender id.UserID) bool {
 	return false
 }
 
-// isAllowed = admin OR explicitly listed in Members. Used to gate
-// claude turns and state-mutating slash commands. Default (Members
-// empty) is admin-only.
+// isAllowed = admin OR explicitly listed in Members OR a peer agent
+// in our fleet. Peer agents are trusted infrastructure (we run them);
+// requiring them to be on each other's Members list defeats inter-
+// agent collaboration. The mention router already ensures peer
+// messages only land here when they explicitly @-mentioned us, so
+// open-ended bot spam is bounded by that gate, not this one.
 func (b *Bridge) isAllowed(sender id.UserID) bool {
 	if b.isAdmin(sender) {
 		return true
@@ -1048,6 +1096,197 @@ func (b *Bridge) isAllowed(sender id.UserID) bool {
 	s := string(sender)
 	for _, m := range b.opts.Members {
 		if m == s {
+			return true
+		}
+	}
+	if b.isPeerAgent(sender) {
+		return true
+	}
+	return false
+}
+
+// mentionRE matches plain-text `@localpart` tokens in a message body.
+// Element's autocomplete pill is reflected in the event's m.mentions
+// field directly, but a user (or another bot) who types `@cindy` by
+// hand has no metadata — we parse the body to recover that case,
+// restricted to known agent localparts so an unrelated `@foo` isn't
+// treated as a mention.
+var mentionRE = regexp.MustCompile(`@([A-Za-z0-9._=\-+/]+)`)
+
+// localpartOf returns the localpart of a full Matrix user id
+// (`@alice:example.org` → `alice`), lowercased.
+func localpartOf(u id.UserID) (string, bool) {
+	s := string(u)
+	if len(s) < 2 || s[0] != '@' {
+		return "", false
+	}
+	end := strings.IndexByte(s, ':')
+	if end <= 1 {
+		return "", false
+	}
+	return strings.ToLower(s[1:end]), true
+}
+
+// shouldIgnoreForRouting decides whether to silently drop a message
+// based on per-room mention routing:
+//
+//   - if this room contains ≤1 of our fleet's agents (i.e. only me),
+//     always respond — single-agent rooms broadcast everything.
+//   - in a multi-agent room a human sender must explicitly @ this
+//     agent (m.mentions OR plain-text `@localpart`); otherwise stay
+//     silent. No @ = no reply, even if no other agent was named.
+//   - in a multi-agent room a peer-agent sender must include this
+//     agent in the protocol-level m.mentions field (text regex is
+//     unsafe for bot-to-bot because reply bodies routinely echo the
+//     recipient's @id and would loop).
+//
+// Falls open (returns false) on any lookup failure — better to over-
+// respond than to drop a legit message.
+func (b *Bridge) shouldIgnoreForRouting(roomID id.RoomID, im matrix.IncomingMessage) (skip bool, reason string) {
+	if b.opts.Manager == nil {
+		return false, ""
+	}
+	me := b.mx.UserID()
+
+	inRoom := b.agentsInRoom(roomID)
+	if len(inRoom) <= 1 {
+		return false, "" // single-agent room: always reply
+	}
+
+	// Peer-agent sender: only m.mentions counts.
+	if im.Sender != me && inRoom[im.Sender] {
+		for _, u := range im.Mentions {
+			if u == me {
+				return false, ""
+			}
+		}
+		return true, "peer agent, no explicit @me"
+	}
+
+	// Human sender in multi-agent room: require explicit @me. Combine
+	// the m.mentions field (Element autocomplete pill) with a regex
+	// parse of the body (hand-typed `@cindy`). Mention of *another*
+	// agent without including me ⇒ still skip; lack of any mention ⇒
+	// also skip (no broadcast in multi-agent rooms).
+	for _, u := range im.Mentions {
+		if u == me {
+			return false, ""
+		}
+	}
+	if myLP, ok := localpartOf(me); ok {
+		for _, m := range mentionRE.FindAllStringSubmatch(im.Text, -1) {
+			if strings.ToLower(m[1]) == myLP {
+				return false, ""
+			}
+		}
+	}
+	return true, "multi-agent room, not @me"
+}
+
+// agentsInRoom returns the set of our fleet's agents currently joined
+// to roomID. Backed by a TTL cache to avoid a homeserver round-trip
+// per message. Returns an empty set (treated as "single-agent →
+// respond") if the lookup fails.
+func (b *Bridge) agentsInRoom(roomID id.RoomID) map[id.UserID]bool {
+	if b.opts.Manager == nil {
+		return nil
+	}
+	members := b.roomMembers(roomID)
+	if members == nil {
+		return nil
+	}
+	out := map[id.UserID]bool{}
+	for _, ai := range b.opts.Manager.List() {
+		uid := id.UserID(ai.UserID)
+		if uid != "" && members[uid] {
+			out[uid] = true
+		}
+	}
+	return out
+}
+
+// roomMembers returns the cached joined-members set for roomID,
+// refreshing if older than membershipTTL. Nil on lookup failure.
+func (b *Bridge) roomMembers(roomID id.RoomID) map[id.UserID]bool {
+	b.mu.Lock()
+	if e, ok := b.membershipCache[roomID]; ok && time.Since(e.fetched) < membershipTTL {
+		b.mu.Unlock()
+		return e.members
+	}
+	b.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	members, err := b.mx.JoinedMemberSet(ctx, roomID)
+	if err != nil {
+		log.Printf("[agent] joined_members(%s) failed: %v", roomID, err)
+		return nil
+	}
+	b.mu.Lock()
+	b.membershipCache[roomID] = &membershipEntry{members: members, fetched: time.Now()}
+	b.mu.Unlock()
+	return members
+}
+
+// invalidateMembership drops the cached membership for roomID. Called
+// from join/leave handlers so a follow-on routing decision sees the
+// fresh roster.
+func (b *Bridge) invalidateMembership(roomID id.RoomID) {
+	b.mu.Lock()
+	delete(b.membershipCache, roomID)
+	b.mu.Unlock()
+}
+
+// peerAgentMentionsInBody scans an outbound message body for plain-
+// text `@localpart` tokens that resolve to another fleet agent, and
+// returns the corresponding Matrix user ids. Used to populate
+// m.mentions on agent-generated messages so peer routers fire on
+// intentional pings (their bot-to-bot dispatch trusts only the
+// protocol field, not text). Returns nil when no peers match.
+func (b *Bridge) peerAgentMentionsInBody(body string) []id.UserID {
+	if b.opts.Manager == nil || body == "" {
+		return nil
+	}
+	me := b.mx.UserID()
+	lp2id := map[string]id.UserID{}
+	for _, ai := range b.opts.Manager.List() {
+		uid := id.UserID(ai.UserID)
+		if uid == "" || uid == me {
+			continue
+		}
+		if lp, ok := localpartOf(uid); ok {
+			lp2id[lp] = uid
+		}
+	}
+	if len(lp2id) == 0 {
+		return nil
+	}
+	seen := map[id.UserID]bool{}
+	var out []id.UserID
+	for _, m := range mentionRE.FindAllStringSubmatch(body, -1) {
+		if uid, ok := lp2id[strings.ToLower(m[1])]; ok && !seen[uid] {
+			seen[uid] = true
+			out = append(out, uid)
+		}
+	}
+	return out
+}
+
+// isPeerAgent reports whether sender is a different configured agent
+// in our fleet (not us, but in Manager.List()). Used to silence ACL
+// denial replies when a peer bot's message slips through the router —
+// e.g. before Manager.List() is populated at startup. Plain ACL log
+// still fires; only the chat-visible reply is suppressed.
+func (b *Bridge) isPeerAgent(sender id.UserID) bool {
+	if b.opts.Manager == nil {
+		return false
+	}
+	me := b.mx.UserID()
+	if sender == me {
+		return false
+	}
+	for _, ai := range b.opts.Manager.List() {
+		if id.UserID(ai.UserID) == sender {
 			return true
 		}
 	}
@@ -1611,7 +1850,12 @@ func (b *Bridge) runTurn(roomID id.RoomID, sender id.UserID, text string, attach
 	for {
 		select {
 		case <-flush.C:
-			t.flushPendingText(ctx)
+			// Keep the typing indicator alive even when the agent is
+			// silent (long tool execution, slow LLM). flushPendingText
+			// early-returns on an unchanged buffer, so refresh has to
+			// run independently here — not after.
+			t.refreshTypingIfStale(ctx)
+			t.flushPendingText(ctx, false)
 		case ev, ok := <-sess.proc.Events():
 			if !ok {
 				log.Printf("[agent] turn %d in %s: agent EOF — evicting session", turnIdx, roomID)
@@ -1621,7 +1865,7 @@ func (b *Bridge) runTurn(roomID id.RoomID, sender id.UserID, text string, attach
 			}
 			done := t.consume(ctx, ev)
 			if done {
-				t.flushPendingText(ctx)
+				t.flushPendingText(ctx, true)
 				log.Printf("[agent] turn %d in %s: done (final-text=%dB, tool_msgs=%d)",
 					turnIdx, roomID, len(t.lastFinalText), t.toolCount)
 				if b.opts.Sessions != nil && t.lastSessionID != "" {
@@ -1721,25 +1965,46 @@ func (t *turn) refreshTypingIfStale(ctx context.Context) {
 
 // flushPendingText sends or edits the streaming text message with the
 // current pending body. No-op when nothing new since last flush.
-func (t *turn) flushPendingText(ctx context.Context) {
+//
+// Auto-populates m.mentions for any peer-agent `@localpart` tokens in
+// the body. Peer routers ignore edit events (they only inspect the
+// INITIAL m.room.message), so a streamed message whose `@peer` token
+// appears late in the body would otherwise reach the peer without
+// mention metadata. In multi-agent rooms we therefore defer ALL
+// flushes until finalize, so the whole text goes out as one event
+// with complete m.mentions — at the cost of no streaming UX, which
+// is acceptable in collaborative rooms. Single-agent rooms keep the
+// 200ms streaming behaviour.
+func (t *turn) flushPendingText(ctx context.Context, final bool) {
 	body := t.pending.String()
 	if body == t.lastFlushed {
 		return
 	}
-	t.lastFlushed = body
+	mentions := t.b.peerAgentMentionsInBody(body)
+	if !final && t.textEvent == "" && len(t.b.agentsInRoom(t.roomID)) > 1 {
+		// Deferred: hold until finalizeText so the initial send
+		// carries the full body + m.mentions atomically.
+		return
+	}
 	t.refreshTypingIfStale(ctx)
 	if t.textEvent == "" {
-		evID, err := t.b.mx.SendText(ctx, t.roomID, body)
+		evID, err := t.b.mx.SendTextMentions(ctx, t.roomID, body, mentions)
 		if err != nil {
+			// Don't advance lastFlushed: next tick will retry the
+			// same (or grown) body rather than treating this tail
+			// as "already delivered".
 			log.Printf("[agent] send streaming text failed: %v", err)
 			return
 		}
 		t.textEvent = evID
+		t.lastFlushed = body
 		return
 	}
-	if err := t.b.mx.EditText(ctx, t.roomID, t.textEvent, body); err != nil {
+	if err := t.b.mx.EditTextMentions(ctx, t.roomID, t.textEvent, body, mentions); err != nil {
 		log.Printf("[agent] edit streaming text failed: %v", err)
+		return
 	}
+	t.lastFlushed = body
 }
 
 // finalizeText caps the current text block: forces a final flush
@@ -1751,7 +2016,7 @@ func (t *turn) finalizeText(ctx context.Context, canonical string) {
 		t.pending.Reset()
 		t.pending.WriteString(canonical)
 	}
-	t.flushPendingText(ctx)
+	t.flushPendingText(ctx, true)
 	if canonical != "" {
 		t.lastFinalText = canonical
 	}
@@ -1810,12 +2075,15 @@ func (t *turn) consume(ctx context.Context, ev runtime.Event) bool {
 		// Close any in-flight streaming text first so timeline order
 		// is preserved.
 		t.finalizeText(ctx, "")
+		t.toolCount++
+		if t.b.opts.IgnoreToolsMsg[strings.ToLower(e.Name)] {
+			return false
+		}
 		body := FormatToolUse(e.Name, e.Input)
 		t.refreshTypingIfStale(ctx)
 		if _, err := t.b.mx.SendText(ctx, t.roomID, body); err != nil {
 			log.Printf("[agent] send tool_use msg failed: %v", err)
 		}
-		t.toolCount++
 		return false
 
 	case runtime.ToolResult:
@@ -1828,7 +2096,18 @@ func (t *turn) consume(ctx context.Context, ev runtime.Event) bool {
 		}
 		body := FormatToolResult(name, e.Content, true)
 		if body != "" {
+			t.refreshTypingIfStale(ctx)
 			_, _ = t.b.mx.SendText(ctx, t.roomID, body)
+		}
+		return false
+
+	case runtime.ImageFinal:
+		// Close any in-flight streaming text so the image appears
+		// after the surrounding prose, not above it.
+		t.finalizeText(ctx, "")
+		t.refreshTypingIfStale(ctx)
+		if _, err := t.b.mx.SendImage(ctx, t.roomID, e.Path, e.MimeType, e.Caption); err != nil {
+			log.Printf("[agent] send image %s failed: %v", e.Path, err)
 		}
 		return false
 
@@ -1838,6 +2117,7 @@ func (t *turn) consume(ctx context.Context, ev runtime.Event) bool {
 
 	case runtime.TurnDone:
 		if e.Err != "" || e.Reason != "" {
+			t.refreshTypingIfStale(ctx)
 			_, _ = t.b.mx.SendText(ctx, t.roomID, formatTurnError(e))
 		}
 		return true

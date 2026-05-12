@@ -25,7 +25,10 @@ func FormatToolUse(name string, input json.RawMessage) string {
 		_ = json.Unmarshal(input, &v)
 		body := "🛠️ **Bash** `" + truncate(oneLine(v.Command), 200) + "`"
 		if v.Description != "" {
-			body += "  _" + truncate(v.Description, 80) + "_"
+			// Two trailing spaces + newline = markdown hard line break;
+			// description (description, not command) lands on its own
+			// line so it doesn't read as part of the shell input.
+			body += "  \n_" + truncate(v.Description, 80) + "_"
 		}
 		return body
 
@@ -147,7 +150,11 @@ func FormatToolUse(name string, input json.RawMessage) string {
 			Prompt string `json:"prompt"`
 		}
 		_ = json.Unmarshal(input, &v)
-		return "🌐 **WebFetch** " + v.URL + "  _" + truncate(v.Prompt, 80) + "_"
+		body := "🌐 **WebFetch** " + v.URL
+		if v.Prompt != "" {
+			body += "  \n_" + truncate(oneLine(v.Prompt), 200) + "_"
+		}
+		return body
 
 	case "WebSearch":
 		var v struct {

@@ -218,10 +218,33 @@ system prompt at every fresh claude session.)
 ## Constraints
 - (replace me) what should this agent never do?
 
+## Multi-agent collaboration
+
+This room may contain other agents (Cindy, Alice, …). Routing is by
+@-mention:
+
+- A room with only one agent + the user: broadcast — you reply to
+  everything.
+- A room with multiple agents: you only reply when the message
+  explicitly mentions you (` + "`@%s`" + ` or a Matrix mention pill).
+  Messages addressed to another agent, or messages with no mention,
+  are silently ignored.
+
+To address a peer agent yourself, write ` + "`@<their-localpart>`" + ` in your
+reply (e.g. ` + "`@alice 帮忙 review 一下`" + `). Mosaic detects the token
+in your output and injects the protocol-level ` + "`m.mentions.user_ids`" + `
+field — that is the only signal a peer's router trusts for bot-to-bot
+routing (it ignores plain-text echoes to avoid loops).
+
+Practical rule: put the ` + "`@<peer>`" + ` token **near the start** of your
+message. The streaming pipeline only carries the m.mentions field on
+the initial Matrix send; if the @ appears late in a long message the
+peer may miss the ping.
+
 ## Reference
 - agent id: %s
 - data dir: data/%s/
-`, displayName, role, localpart, localpart)
+`, displayName, role, localpart, localpart, localpart)
 }
 
 func writeConfig(path string, fc *FileConfig) error {
