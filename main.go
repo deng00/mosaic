@@ -41,12 +41,9 @@ import (
 	// Register all runtime drivers (init() side-effect). Add a new
 	// line here per new runtime; the agent.Options.Runtime field is
 	// resolved against the registry built up by these imports.
+	"github.com/deng00/mosaic/pkg/matrix"
 	_ "github.com/deng00/mosaic/pkg/runtime/claude"
 	_ "github.com/deng00/mosaic/pkg/runtime/codex"
-	"github.com/deng00/mosaic/pkg/dispatch"
-	"github.com/deng00/mosaic/pkg/matrix"
-	"github.com/deng00/mosaic/pkg/task"
-	"github.com/deng00/mosaic/pkg/web"
 )
 
 func main() {
@@ -64,47 +61,10 @@ func main() {
 
 	var wg sync.WaitGroup
 	var runtime *AgentRuntime
-	var taskStore *task.Store
-	var webSrv *web.Server
 	if fc != nil {
 		all := fc.AllAgents()
 		log.Printf("loaded %s — %d agent(s)", *configPath, len(all))
 		runtime = NewAgentRuntime(ctx, fc, *configPath, &wg)
-		taskStore = task.NewStore(projectsDataDir(fc.DataDir))
-		runtime.tasks = taskStore
-
-		if fc.Web.Enabled {
-			s, err := startWebServer(fc, taskStore, runtime)
-			if err != nil {
-				log.Printf("web: disabled — %v", err)
-			} else {
-				webSrv = s
-			}
-		}
-
-		// Auto-dispatch: tasks moved into in_progress fan out to an
-		// idle agent. APIBase / APIToken plumb the per-task callback
-		// env when the web server is up; left empty otherwise (the
-		// agent then has no programmatic way to flip state, and a
-		// human moves it via the board).
-		dCfg := dispatch.Config{
-			DataDir:              fc.DataDir,
-			DefaultWorkspaceRoot: filepath.Join(fc.DataDir, "workspaces"),
-		}
-		if webSrv != nil {
-			dCfg.APIBase = "http://" + webSrv.Addr()
-			dCfg.APIToken = webSrv.Token()
-		}
-		dispatcher := dispatch.New(dCfg, taskStore, newDispatchMemory(fc), newDispatchSink(runtime, fc))
-		dispatcher.Start()
-		log.Printf("[dispatch] enabled (workspaceRoot=%s, callbackAPI=%q)", dCfg.DefaultWorkspaceRoot, dCfg.APIBase)
-
-		// Push an Element widget into every Space configured with
-		// task_prefix so users get a "Tasks" entry in the Space's
-		// Widgets panel without manual setup. Idempotent + retried
-		// in the background until at least one agent is joined.
-		startWidgetPusher(ctx, fc, webSrv, runtime)
-
 		for _, bc := range all {
 			wg.Add(1)
 			botCtx, botCancel := context.WithCancel(ctx)
@@ -133,38 +93,7 @@ func main() {
 	}()
 
 	wg.Wait()
-	if webSrv != nil {
-		webSrv.Stop()
-	}
 	log.Printf("bye")
-}
-
-// startWebServer brings up the task-board HTTP listener.
-func startWebServer(fc *FileConfig, store *task.Store, rt *AgentRuntime) (*web.Server, error) {
-	port := fc.Web.Port
-	if port == 0 {
-		port = 24527
-	}
-	bind := fc.Web.Bind
-	if bind == "" {
-		bind = "127.0.0.1"
-	}
-	srv, err := web.New(web.Options{
-		Bind:      bind,
-		Port:      port,
-		TokenPath: filepath.Join(fc.DataDir, "web.token"),
-		Store:     store,
-		Provider:  newWebProvider(rt),
-	})
-	if err != nil {
-		return nil, err
-	}
-	if err := srv.Start(); err != nil {
-		return nil, err
-	}
-	log.Printf("[web] task board listening on http://%s", srv.Addr())
-	log.Printf("[web] bearer token persisted at %s/web.token", fc.DataDir)
-	return srv, nil
 }
 
 // runBot drives one agent's lifecycle: login, build bridge, sync
@@ -267,7 +196,7 @@ func runBot(ctx context.Context, fc *FileConfig, bc BotConfig, mgr *AgentRuntime
 		IgnoreToolsMsg: resolveIgnoreToolsMsg(bc.IgnoreToolsMsg),
 	})
 	if mgr != nil {
-		mgr.trackBridge(bc.ID, br)
+		mgr.trackBridge(br)
 	}
 	br.Start()
 

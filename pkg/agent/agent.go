@@ -39,14 +39,10 @@ type ProjectConfig struct {
 }
 
 // RoomConfig overrides project / fallback values for a single room.
-// All fields are optional; empty means "fall through".
+// Both fields are optional; empty means "fall through".
 type RoomConfig struct {
 	Cwd   string
 	Model string
-	// Env is extra KEY=VALUE pairs merged into the per-spawn env for
-	// THIS room only. Used by the dispatcher to inject task-scoped
-	// callback credentials (MOSAIC_TASK_ID, MOSAIC_TOKEN, etc.).
-	Env map[string]string
 }
 
 // resolution is the per-room derived settings: which project the room
@@ -57,7 +53,6 @@ type resolution struct {
 	ProjectName string
 	Cwd         string
 	Model       string
-	Env         map[string]string // per-room env merged on top of Options.Env
 }
 
 // Options configures the Bridge. Cwd defaults to the process cwd if
@@ -207,85 +202,6 @@ func (b *Bridge) UpdateMembers(members []string) {
 	b.mu.Unlock()
 }
 
-// RegisterRoomOverride installs (or replaces) a per-room cwd / model /
-// env override. Used by the dispatcher to attach a workspace path +
-// task-callback env to a freshly created topic-room before spawning
-// claude in it. Drops any cached resolution so the next spawn picks up
-// the new values.
-func (b *Bridge) RegisterRoomOverride(roomID id.RoomID, rc RoomConfig) {
-	b.mu.Lock()
-	if b.opts.Rooms == nil {
-		b.opts.Rooms = map[string]RoomConfig{}
-	}
-	b.opts.Rooms[string(roomID)] = rc
-	delete(b.resolutions, roomID)
-	b.mu.Unlock()
-}
-
-// MatrixUserID exposes the agent's own Matrix user id for callers
-// (e.g. dispatcher needs it to know who created a room).
-func (b *Bridge) MatrixUserID() id.UserID {
-	return b.mx.UserID()
-}
-
-// EnsureWidget upserts a widget state event in roomID. The bot must
-// be a joined member of roomID with permission to set state. Idempotent
-// — same stateKey overwrites the same event.
-func (b *Bridge) EnsureWidget(ctx context.Context, roomID id.RoomID, stateKey, name, widgetURL string) error {
-	return b.mx.EnsureWidget(ctx, roomID, stateKey, name, widgetURL)
-}
-
-// HasJoinedRoom reports whether this bridge's bot account is currently
-// in roomID. Used by callers that need to wait until membership is in
-// place before sending state events.
-func (b *Bridge) HasJoinedRoom(ctx context.Context, roomID id.RoomID) bool {
-	return b.mx.HasJoinedRoom(ctx, roomID)
-}
-
-// CreateTaskRoom asks the underlying matrix client to create a topic-
-// room owned by this agent, attached to parentSpace, with the given
-// invitees. Convenience wrapper so the dispatcher doesn't need its
-// own *matrix.Client handle.
-func (b *Bridge) CreateTaskRoom(ctx context.Context, name, topic string, parentSpace id.RoomID, invite []id.UserID) (id.RoomID, error) {
-	return b.mx.CreateRoom(ctx, matrix.CreateRoomOpts{
-		Name:        name,
-		Topic:       topic,
-		ParentSpace: parentSpace,
-		Invite:      invite,
-		Preset:      "private_chat",
-	})
-}
-
-// RunTaskTurn kicks off a fresh claude turn in roomID. Skips the usual
-// ACL / sender-filter path because the dispatcher (not a human user)
-// is the trigger. The room must already have its per-room override
-// registered via RegisterRoomOverride so the spawn picks up the
-// workspace cwd + task env.
-//
-// kickoff is the visible chat message that triggers the turn; agents
-// see it as a regular user message. Keep it short — the heavy lifting
-// belongs in the system-prompt layer (Memory / TASK.md).
-func (b *Bridge) RunTaskTurn(roomID id.RoomID, kickoff string) error {
-	ctx := context.Background()
-	// Render the kickoff visibly into the room first so users in
-	// Element see what was sent to the agent. Best-effort.
-	if _, err := b.mx.SendText(ctx, roomID, kickoff); err != nil {
-		log.Printf("[agent] task kickoff send failed: %v", err)
-	}
-	sess := b.getOrCreate(ctx, roomID)
-	if sess == nil || sess.inbox == nil {
-		return fmt.Errorf("agent: failed to spawn claude for task room %s", roomID)
-	}
-	// Push directly into the inbox — handleMessage filters out the
-	// bridge's own UID, which would make a self-sent kickoff a no-op.
-	select {
-	case sess.inbox <- turnRequest{sender: b.mx.UserID(), text: kickoff}:
-		return nil
-	default:
-		return fmt.Errorf("agent: task room %s inbox full", roomID)
-	}
-}
-
 // expandHome expands a leading ~ to $HOME. Go's exec/chdir don't do
 // this (the shell does), so user-typed config paths like
 // `~/Code/foo` literally try to chdir into a directory named "~",
@@ -340,20 +256,13 @@ func (b *Bridge) resolve(ctx context.Context, roomID id.RoomID) resolution {
 
 	// Per-room override wins over both. Useful for one-off rooms
 	// that should aim a sandboxed cwd while still being visually
-	// inside a regular Space, and for the dispatcher's per-task
-	// rooms (workspace cwd + task callback env).
+	// inside a regular Space.
 	if rc, ok := b.opts.Rooms[string(roomID)]; ok {
 		if rc.Cwd != "" {
 			r.Cwd = rc.Cwd
 		}
 		if rc.Model != "" {
 			r.Model = rc.Model
-		}
-		if len(rc.Env) > 0 {
-			r.Env = make(map[string]string, len(rc.Env))
-			for k, v := range rc.Env {
-				r.Env[k] = v
-			}
 		}
 	}
 
@@ -2188,7 +2097,6 @@ func (b *Bridge) getOrCreate(ctx context.Context, roomID id.RoomID) *roomSession
 		appendSP += "\n\n"
 	}
 	appendSP += askUserProtocol
-	mergedEnv := mergeEnv(b.opts.Env, r.Env)
 	rt := b.opts.Runtime
 	if rt == "" {
 		rt = "claude"
@@ -2199,7 +2107,7 @@ func (b *Bridge) getOrCreate(ctx context.Context, roomID id.RoomID) *roomSession
 		log.Printf("[agent] get runtime driver failed: %v", err)
 		return &roomSession{cancel: cancel}
 	}
-	log.Printf("[agent] spawning %s (cwd=%s model=%q effort=%q resume=%q sysPromptLen=%d envKeys=%d)", rt, cwd, model, b.opts.Effort, resume, len(appendSP), len(mergedEnv))
+	log.Printf("[agent] spawning %s (cwd=%s model=%q effort=%q resume=%q sysPromptLen=%d envKeys=%d)", rt, cwd, model, b.opts.Effort, resume, len(appendSP), len(b.opts.Env))
 	proc, err := drv.Spawn(procCtx, runtime.Options{
 		Cwd:                cwd,
 		Model:              model,
@@ -2207,7 +2115,7 @@ func (b *Bridge) getOrCreate(ctx context.Context, roomID id.RoomID) *roomSession
 		PermissionMode:     b.opts.PermissionMode,
 		Binary:             b.opts.Binary,
 		Resume:             resume,
-		ExtraEnv:           envMapToSlice(mergedEnv),
+		ExtraEnv:           envMapToSlice(b.opts.Env),
 		AppendSystemPrompt: appendSP,
 	})
 	if err != nil {
@@ -2308,22 +2216,6 @@ func envMapToSlice(m map[string]string) []string {
 	out := make([]string, 0, len(m))
 	for k, v := range m {
 		out = append(out, k+"="+v)
-	}
-	return out
-}
-
-// mergeEnv returns base ⊕ overlay (overlay wins). Either side may be
-// nil; result is nil only when both are.
-func mergeEnv(base, overlay map[string]string) map[string]string {
-	if len(base) == 0 && len(overlay) == 0 {
-		return nil
-	}
-	out := make(map[string]string, len(base)+len(overlay))
-	for k, v := range base {
-		out[k] = v
-	}
-	for k, v := range overlay {
-		out[k] = v
 	}
 	return out
 }

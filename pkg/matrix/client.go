@@ -382,48 +382,6 @@ func (c *Client) DeleteUserRoomTag(ctx context.Context, roomID id.RoomID, tag st
 	return err
 }
 
-// widgetEventType is Element's legacy state-event type for room/space
-// widgets. The newer `m.widget` type isn't yet honored by every Element
-// build; sticking with the im.vector one keeps it visible in the
-// "Widgets" panel of all current Element clients.
-var widgetEventType = event.Type{Type: "im.vector.modular.widgets", Class: event.StateEventType}
-
-// EnsureWidget upserts an Element widget state event in roomID.
-// stateKey is the widget's stable id (use a deterministic value so
-// repeated calls are idempotent — they edit the same state event).
-// Pass empty url to delete the widget (Element interprets empty
-// content as "removed"). Common content fields:
-//
-//	type: "customwidget"  // generic external URL
-//	url:  the URL Element will iframe
-//	name: visible label in the Widgets panel
-//	data: arbitrary JSON forwarded to the widget
-func (c *Client) EnsureWidget(ctx context.Context, roomID id.RoomID, stateKey, name, widgetURL string) error {
-	content := map[string]any{
-		"type": "customwidget",
-		"url":  widgetURL,
-		"name": name,
-		"data": map[string]any{},
-	}
-	_, err := c.mx.SendStateEvent(ctx, roomID, widgetEventType, stateKey, content)
-	if err != nil {
-		return fmt.Errorf("matrix: ensure widget %s in %s: %w", stateKey, roomID, err)
-	}
-	return nil
-}
-
-// HasJoinedRoom reports whether the bot's account is currently joined
-// to roomID. Used by the widget pusher to wait until the bot is in a
-// Space before trying to set state events on it.
-func (c *Client) HasJoinedRoom(ctx context.Context, roomID id.RoomID) bool {
-	resp, err := c.mx.JoinedMembers(ctx, roomID)
-	if err != nil {
-		return false
-	}
-	_, ok := resp.Joined[c.mx.UserID]
-	return ok
-}
-
 // JoinedMemberSet returns the set of currently-joined user ids in
 // roomID. Wraps the `/joined_members` API. Used by the bridge to
 // decide if a room is "single-agent" (only one of our fleet present →
@@ -455,7 +413,7 @@ func (c *Client) MyPowerLevel(ctx context.Context, roomID id.RoomID) (int, error
 	return pl.UsersDefault, nil
 }
 
-// CreateRoomOpts configures a per-task topic-room creation.
+// CreateRoomOpts configures one CreateRoom call.
 type CreateRoomOpts struct {
 	Name        string      // visible name in Element
 	Topic       string      // visible topic / description
@@ -467,9 +425,8 @@ type CreateRoomOpts struct {
 	// publish m.space.child in the parent (typically: bot lacks PL 50)
 	// is fatal: CreateRoom leaves the just-created orphan room and
 	// returns an error so callers don't accumulate invisible rooms.
-	// Default false preserves the legacy "best-effort" semantics for
-	// existing callers (e.g. the dispatcher) where an unlinked room
-	// is still usable.
+	// Default false preserves "best-effort" semantics: the room is
+	// created and returned even if the Space link fails.
 	StrictParentLink bool
 }
 
@@ -496,15 +453,14 @@ func (c *Client) CreateRoom(ctx context.Context, opts CreateRoomOpts) (id.RoomID
 	roomID := resp.RoomID
 	if opts.ParentSpace != "" {
 		// Best-effort wire into the Space. Failures here don't void
-		// the room; log and continue (the room is still usable).
+		// the room (unless StrictParentLink is set).
 		via := serverPart(string(c.mx.UserID))
 		if _, err := c.mx.SendStateEvent(ctx, opts.ParentSpace, event.StateSpaceChild, string(roomID),
 			&event.SpaceChildEventContent{Via: []string{via}}); err != nil {
 			log.Printf("[matrix] m.space.child failed (room created OK): %v", err)
 			if opts.StrictParentLink {
 				// Clean up the orphan so we don't leave invisible
-				// rooms in the bot's joined-set. Best-effort —
-				// LeaveRoom failure here is rare and not actionable.
+				// rooms in the bot's joined-set. Best-effort.
 				if _, leaveErr := c.mx.LeaveRoom(ctx, roomID); leaveErr != nil {
 					log.Printf("[matrix] orphan cleanup leave %s failed: %v", roomID, leaveErr)
 				}

@@ -70,10 +70,6 @@ func (m *Memory) SystemPrompt(spaceID, roomID id.RoomID) string {
 		add(filepath.Join(spaceDir, "DECISIONS.md"), "Project decisions log")
 		if roomID != "" {
 			roomDir := filepath.Join(spaceDir, "rooms", safeID(string(roomID)))
-			// TASK.md is written by the dispatcher when it auto-routes
-			// a task into a topic-room; gives the agent the rendered
-			// WORKFLOW + task brief as part of the system prompt.
-			add(filepath.Join(roomDir, "TASK.md"), "Active task brief")
 			add(filepath.Join(roomDir, "SUMMARY.md"), "Earlier conversation summary (this room)")
 		}
 	}
@@ -85,35 +81,10 @@ func (m *Memory) SystemPrompt(spaceID, roomID id.RoomID) string {
 	return "The following memory files were prepared by previous sessions or by the operator. Treat them as authoritative context for this conversation.\n" + out
 }
 
-// WriteTaskBrief writes a TASK.md for a topic-room. Used by the
-// dispatcher to hand the rendered WORKFLOW prompt to the agent via
-// the system-prompt layer (see SystemPrompt). Atomic via tmp+rename.
-func (m *Memory) WriteTaskBrief(spaceID, roomID id.RoomID, body string) error {
-	return m.writeRoomFile(spaceID, roomID, "TASK.md", body)
-}
-
-// ClearTaskBrief removes TASK.md (best-effort, no error if absent).
-// Called when a task leaves in_progress so a future room reuse
-// doesn't see stale instructions.
-func (m *Memory) ClearTaskBrief(spaceID, roomID id.RoomID) error {
-	if m == nil || m.projectsDir == "" || spaceID == "" || roomID == "" {
-		return nil
-	}
-	path := filepath.Join(m.projectsDir, safeID(string(spaceID)), "rooms", safeID(string(roomID)), "TASK.md")
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
-}
-
 // WriteSummary saves the latest /compact output as the room's
 // SUMMARY.md, in the SHARED projects tree (so other agents in the
 // same room see it on their next session). Atomic via tmp+rename.
 func (m *Memory) WriteSummary(spaceID, roomID id.RoomID, body string) error {
-	return m.writeRoomFile(spaceID, roomID, "SUMMARY.md", body)
-}
-
-func (m *Memory) writeRoomFile(spaceID, roomID id.RoomID, name, body string) error {
 	if m == nil || m.projectsDir == "" {
 		return nil
 	}
@@ -126,7 +97,7 @@ func (m *Memory) writeRoomFile(spaceID, roomID id.RoomID, name, body string) err
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	path := filepath.Join(dir, name)
+	path := filepath.Join(dir, "SUMMARY.md")
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, []byte(body), 0o600); err != nil {
 		return err
