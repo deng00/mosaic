@@ -4,6 +4,8 @@
 // the bridge doesn't import main.
 package agent
 
+import "github.com/deng00/mosaic/pkg/matrix"
+
 // AgentInfo is what /agent list shows in chat.
 type AgentInfo struct {
 	ID         string // config id, also the data subdir name
@@ -58,14 +60,9 @@ type AgentManager interface {
 	// deciding a fallback.
 	EnsureProject(spaceID, name string) (created bool, err error)
 
-	// Members returns the current allow-list (non-admin users
-	// authorised to drive agents). Admins are NOT included here —
-	// callers should check Admins separately or use Bridge.isAllowed.
-	Members() []string
-
-	// AddMember / RemoveMember edit the allow-list and persist to
-	// config.yaml. Both are idempotent. Broadcasts the new list to
-	// all running bridges so /agent allow takes effect immediately.
-	AddMember(userID string) error
-	RemoveMember(userID string) error
+	// Clients returns the live *matrix.Client for every currently
+	// online agent, keyed by agent ID. Used by fleet-wide operations
+	// (e.g. /export) that must talk to every agent's homeserver
+	// session and crypto store. Offline agents are omitted.
+	Clients() map[string]*matrix.Client
 }

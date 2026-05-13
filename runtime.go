@@ -14,6 +14,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/deng00/mosaic/pkg/agent"
+	"github.com/deng00/mosaic/pkg/matrix"
 	"github.com/deng00/mosaic/pkg/registrar"
 )
 
@@ -37,6 +38,7 @@ type AgentRuntime struct {
 type runningAgent struct {
 	bc     BotConfig
 	cancel context.CancelFunc
+	mx     *matrix.Client // populated by attachClient after login succeeds
 }
 
 func NewAgentRuntime(ctx context.Context, fc *FileConfig, path string, wg *sync.WaitGroup) *AgentRuntime {
@@ -61,6 +63,32 @@ func (r *AgentRuntime) trackStop(id string) {
 	r.mu.Lock()
 	delete(r.running, id)
 	r.mu.Unlock()
+}
+
+// attachClient associates the just-logged-in matrix.Client with the
+// running entry for bc.ID. Called from runBot after matrix.Login
+// succeeds so /export and other fleet-wide ops can reach every agent's
+// crypto store.
+func (r *AgentRuntime) attachClient(id string, mx *matrix.Client) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if ra, ok := r.running[id]; ok {
+		ra.mx = mx
+	}
+}
+
+// Clients implements agent.AgentManager.Clients. Only online agents
+// (those that completed login and got attachClient'd) appear.
+func (r *AgentRuntime) Clients() map[string]*matrix.Client {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]*matrix.Client, len(r.running))
+	for id, ra := range r.running {
+		if ra.mx != nil {
+			out[id] = ra.mx
+		}
+	}
+	return out
 }
 
 // List implements agent.AgentManager.List.
@@ -257,69 +285,7 @@ func writeConfig(path string, fc *FileConfig) error {
 func (r *AgentRuntime) trackBridge(b *agent.Bridge) {
 	r.mu.Lock()
 	r.bridges = append(r.bridges, b)
-	// Make sure the new bridge starts with the live members list.
-	members := append([]string(nil), r.cfg.Members...)
 	r.mu.Unlock()
-	b.UpdateMembers(members)
-}
-
-// Members implements agent.AgentManager.Members.
-func (r *AgentRuntime) Members() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return append([]string(nil), r.cfg.Members...)
-}
-
-// AddMember implements agent.AgentManager.AddMember. Idempotent.
-func (r *AgentRuntime) AddMember(userID string) error {
-	if userID == "" {
-		return fmt.Errorf("userID required")
-	}
-	r.mu.Lock()
-	for _, m := range r.cfg.Members {
-		if m == userID {
-			r.mu.Unlock()
-			return nil // already in
-		}
-	}
-	r.cfg.Members = append(r.cfg.Members, userID)
-	if err := writeConfig(r.cfgPath, r.cfg); err != nil {
-		r.mu.Unlock()
-		return err
-	}
-	members := append([]string(nil), r.cfg.Members...)
-	bridges := append([]*agent.Bridge(nil), r.bridges...)
-	r.mu.Unlock()
-	for _, b := range bridges {
-		b.UpdateMembers(members)
-	}
-	return nil
-}
-
-// RemoveMember implements agent.AgentManager.RemoveMember. Idempotent.
-func (r *AgentRuntime) RemoveMember(userID string) error {
-	if userID == "" {
-		return fmt.Errorf("userID required")
-	}
-	r.mu.Lock()
-	out := r.cfg.Members[:0]
-	for _, m := range r.cfg.Members {
-		if m != userID {
-			out = append(out, m)
-		}
-	}
-	r.cfg.Members = out
-	if err := writeConfig(r.cfgPath, r.cfg); err != nil {
-		r.mu.Unlock()
-		return err
-	}
-	members := append([]string(nil), r.cfg.Members...)
-	bridges := append([]*agent.Bridge(nil), r.bridges...)
-	r.mu.Unlock()
-	for _, b := range bridges {
-		b.UpdateMembers(members)
-	}
-	return nil
 }
 
 // Projects implements agent.AgentManager.Projects.

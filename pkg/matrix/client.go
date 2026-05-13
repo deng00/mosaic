@@ -283,18 +283,6 @@ func (c *Client) OnSpaceJoined(h SpaceJoinedHandler) {
 	c.spaceJoined = h
 }
 
-// Redact deletes a message event from the room timeline. Used by
-// the bridge to clean up the "raw streamed text" bubble when the
-// model's reply was nothing but an <ask_user> envelope — the
-// rendered poll card is sent as a fresh message and the envelope
-// shouldn't linger above it. Per Matrix spec a user can always
-// redact their own events, so this works even when the bot has
-// PL 0 in the room.
-func (c *Client) Redact(ctx context.Context, roomID id.RoomID, eventID id.EventID, reason string) error {
-	_, err := c.mx.RedactEvent(ctx, roomID, eventID, mautrix.ReqRedact{Reason: reason})
-	return err
-}
-
 // OnPollResponse registers the inbound poll-response handler. The
 // bot's own responses are filtered out before reaching h. Must be
 // called before Sync.
@@ -647,6 +635,64 @@ func (c *Client) SpaceHierarchy(ctx context.Context) (map[id.RoomID][]id.RoomID,
 		}
 	}
 	return childToParents, nil
+}
+
+// JoinedRoomIDs is a thin wrapper over /joined_rooms used by export
+// and other fleet-wide enumerators. Returned in homeserver order — no
+// sorting, callers shouldn't assume one.
+func (c *Client) JoinedRoomIDs(ctx context.Context) ([]id.RoomID, error) {
+	resp, err := c.mx.JoinedRooms(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("matrix: joined_rooms: %w", err)
+	}
+	return resp.JoinedRooms, nil
+}
+
+// RoomMessagesBackward fetches one page of history for roomID, walking
+// backwards from `from` (empty = latest). Returns the raw event chunk
+// and the pagination token to use for the next call. When `end` comes
+// back empty the room has been fully walked.
+//
+// Events are NOT decrypted here — Messages chunks come from the server
+// as-is. Run DecryptIfEncrypted on each event afterwards.
+func (c *Client) RoomMessagesBackward(ctx context.Context, roomID id.RoomID, from string, limit int) (chunk []*event.Event, end string, err error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	resp, err := c.mx.Messages(ctx, roomID, from, "", mautrix.DirectionBackward, nil, limit)
+	if err != nil {
+		return nil, "", fmt.Errorf("matrix: messages %s: %w", roomID, err)
+	}
+	return resp.Chunk, resp.End, nil
+}
+
+// DecryptIfEncrypted decrypts evt in place when it's an m.room.encrypted
+// megolm event. For plaintext events it's a no-op (returns evt unchanged).
+// The returned event has Type / Content rewritten to the cleartext form
+// when decryption succeeds.
+//
+// Failure modes (returned as error): no megolm session for this event
+// (the agent joined the room after the key rotated and never received
+// it), corrupted ciphertext, or the helper's olm machine isn't ready.
+// Callers should record the failure but keep walking — one missing
+// session shouldn't abort a room export.
+func (c *Client) DecryptIfEncrypted(ctx context.Context, evt *event.Event) (*event.Event, error) {
+	if evt.Type != event.EventEncrypted {
+		return evt, nil
+	}
+	// Messages-endpoint events arrive with Content.VeryRaw populated but
+	// Parsed nil; DecryptMegolmEvent type-asserts on Parsed so we must
+	// fill it first.
+	if evt.Content.Parsed == nil {
+		if err := evt.Content.ParseRaw(evt.Type); err != nil {
+			return evt, fmt.Errorf("parse encrypted content: %w", err)
+		}
+	}
+	decrypted, err := c.helper.Machine().DecryptMegolmEvent(ctx, evt)
+	if err != nil {
+		return evt, err
+	}
+	return decrypted, nil
 }
 
 // Sync runs the long-poll sync loop until ctx is cancelled.

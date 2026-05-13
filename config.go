@@ -59,13 +59,6 @@ type FileConfig struct {
 	// drive agents.
 	Admins []string `yaml:"admins,omitempty"`
 
-	// Members are non-admin Matrix user IDs allowed to chat with /
-	// drive agents. Empty = admin-only (paranoid default — random
-	// users from the same homeserver who somehow end up in a room
-	// with the agent get a polite refusal). Use /agent allow @user
-	// from chat to extend.
-	Members []string `yaml:"members,omitempty"`
-
 	// SharedSecret is Synapse's registration_shared_secret (copied
 	// verbatim from homeserver.yaml). Used by /agent new to register
 	// new Matrix users without an admin token. If empty, /agent new

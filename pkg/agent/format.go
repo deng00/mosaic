@@ -155,49 +155,18 @@ func FormatToolUse(name string, input json.RawMessage) string {
 		_ = json.Unmarshal(input, &v)
 		return "🔍 **WebSearch**  \n`" + truncate(v.Query, 120) + "`"
 
+	case "Skill":
+		var v struct {
+			Skill string `json:"skill"`
+		}
+		_ = json.Unmarshal(input, &v)
+		return "🧩 **Skill**  \n`" + v.Skill + "`"
+
 	default:
 		// Unknown tool: show name and a tiny preview of input.
 		preview := truncate(oneLine(string(input)), 100)
 		return fmt.Sprintf("🔧 **%s**  \n`%s`", name, preview)
 	}
-}
-
-// FormatToolResult turns the tool_result content into a brief
-// confirmation line. Most are not worth surfacing — return "" to
-// suppress. We do surface errors so the user sees failures.
-func FormatToolResult(toolName string, content json.RawMessage, isError bool) string {
-	if !isError {
-		return "" // success is implicit; don't spam
-	}
-	out := stringifyToolResult(content)
-	if out == "" {
-		return "⚠️ tool error"
-	}
-	return "⚠️ **" + toolName + " error**\n```\n" + truncate(out, 800) + "\n```"
-}
-
-func stringifyToolResult(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		return s
-	}
-	var blocks []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
-	if err := json.Unmarshal(raw, &blocks); err == nil {
-		var sb strings.Builder
-		for _, b := range blocks {
-			if b.Type == "text" {
-				sb.WriteString(b.Text)
-			}
-		}
-		return sb.String()
-	}
-	return string(raw)
 }
 
 // relPath shortens absolute paths under $HOME to ~/foo style and

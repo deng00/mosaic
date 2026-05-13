@@ -15,7 +15,7 @@
 // Each driver hides its native protocol behind:
 //   - Process: Send(text) / Events() / Close()
 //   - Event: a small normalized type the bridge consumes uniformly
-//     (mirrors what FormatToolUse / FormatToolResult already render).
+//     (mirrors what FormatToolUse already renders).
 package runtime
 
 import (

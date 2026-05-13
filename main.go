@@ -139,6 +139,9 @@ func runBot(ctx context.Context, fc *FileConfig, bc BotConfig, mgr *AgentRuntime
 		return
 	}
 	log.Printf("[%s] logged in as %s", bc.ID, mx.UserID())
+	if mgr != nil {
+		mgr.attachClient(bc.ID, mx)
+	}
 	if bc.DisplayName != "" {
 		if err := mx.SetDisplayName(ctx, bc.DisplayName); err != nil {
 			log.Printf("[%s] set display name failed: %v", bc.ID, err)
@@ -190,8 +193,8 @@ func runBot(ctx context.Context, fc *FileConfig, bc BotConfig, mgr *AgentRuntime
 		Memory:         agent.NewMemory(dataDir, projectsDataDir(fc.DataDir)),
 		Manager:        mgr,
 		Admins:         fc.Admins,
-		Members:        fc.Members,
 		ServerName:     fc.ServerName,
+		DataDir:        fc.DataDir,
 		Env:            bc.Env,
 		IgnoreToolsMsg: resolveIgnoreToolsMsg(bc.IgnoreToolsMsg),
 	})

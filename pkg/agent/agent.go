@@ -28,6 +28,7 @@ import (
 
 	"github.com/deng00/mosaic/pkg/runtime"
 	"github.com/deng00/mosaic/pkg/matrix"
+	"github.com/deng00/mosaic/pkg/export"
 )
 
 // ProjectConfig is the cwd/model defaults for a Matrix Space (= a
@@ -94,17 +95,12 @@ type Options struct {
 	// and /agent new. nil → those slash commands report "unavailable".
 	Manager AgentManager
 
-	// Admins are full Matrix user IDs allowed to run /agent new and
-	// other management commands. Always implicitly allowed to drive
-	// agents (no need to also list in Members).
+	// Admins are full Matrix user IDs allowed to run management
+	// commands (`/agent new`, `/project cwd`, `/export`, …). Any other
+	// Matrix room member can chat with the agent normally — Matrix
+	// room invites are the membership gate, Admins is only about
+	// "who can mutate config / fleet state from chat".
 	Admins []string
-
-	// Members are non-admin Matrix user IDs allowed to chat with /
-	// drive the agent (claude turns + tier-2 slashes like
-	// /new-session, /compact). Empty = admin-only. Read-only commands
-	// (/help, /status, /agent help|list, /project help|status|list)
-	// remain accessible to anyone in the room.
-	Members []string
 
 	// Env is extra KEY=VALUE pairs injected into every spawned
 	// claude subprocess. Useful for CLAUDE_CODE_OAUTH_TOKEN etc.
@@ -120,6 +116,14 @@ type Options struct {
 	// to fold the `:server` suffix off displayed room/user IDs that
 	// belong to us — purely a UI sweetener.
 	ServerName string
+
+	// DataDir is the daemon-level data root (fc.DataDir). The bridge
+	// only uses it to derive sibling subdirectories like
+	// `<DataDir>/exports/` for /export output. Per-agent / per-project
+	// state has its own dedicated fields (Memory, Sessions); don't
+	// pile new file-backed state onto DataDir without thinking about
+	// the agents/projects split documented in CLAUDE.md.
+	DataDir string
 }
 
 // Bridge owns one Matrix client and a per-room claude session map.
@@ -156,17 +160,11 @@ const inboxFullMsg = "⏳ 排队太多了，暂时无法接收。请稍候再试
 // pendingAsk tracks an open question awaiting a vote. eventID is the
 // poll-start event the bot posted; handlePollResponse matches inbound
 // m.poll.response events against it and looks up options[idx-1] for
-// the chosen answer id ("opt-N"). toolUseID is set only when the
-// prompt originated from an AskUserQuestion tool_use we intercepted —
-// it's used to suppress the SDK's auto-generated error tool_result
-// for that same id (see Bridge.isInterceptedAskToolUseID). Resolution
-// always injects the chosen text as a fresh user turn; the tool
-// channel itself is not fulfilled by us (the SDK pre-resolves it in
-// headless mode).
+// the chosen answer id ("opt-N"). Resolution injects the chosen text
+// as a fresh user turn.
 type pendingAsk struct {
-	eventID   id.EventID
-	options   []string
-	toolUseID string
+	eventID id.EventID
+	options []string
 }
 
 func New(mx *matrix.Client, opts Options) *Bridge {
@@ -198,15 +196,6 @@ func (b *Bridge) InvalidateResolutions(projects map[string]ProjectConfig, rooms 
 	if rooms != nil {
 		b.opts.Rooms = rooms
 	}
-	b.mu.Unlock()
-}
-
-// UpdateMembers swaps in a new allow-list. Called from the manager
-// after /agent allow / /agent revoke so the new value is visible to
-// every running bridge without an agent restart.
-func (b *Bridge) UpdateMembers(members []string) {
-	b.mu.Lock()
-	b.opts.Members = members
 	b.mu.Unlock()
 }
 
@@ -291,47 +280,35 @@ func (b *Bridge) Start() {
 	b.mx.OnPollResponse(b.handlePollResponse)
 }
 
-// askUserProtocol is appended to every spawn's system prompt so the
-// model knows the exact envelope to emit when it wants the user to
-// pick from discrete options. The bridge parses these blocks out of
-// the final assistant text and renders an interactive Matrix
-// message with 1️⃣..N reactions; the user's emoji pick becomes the
-// next user turn verbatim.
+// askUserDeferredProtocol tells the model how Mosaic handles the
+// AskUserQuestion tool. The SDK auto-fails this tool in headless mode
+// (no TTY); without this directive claude reads the error and just
+// keeps going on its own assumptions, so the user's later poll vote
+// arrives mid-other-work and confuses the conversation.
 //
-// Constraints we enforce in the parser:
-//   - 2 ≤ option count ≤ 10
-//   - each option on its own bullet line ("- " or "* ")
-//   - question is everything else inside the block (typically one line)
-//
-// Malformed blocks are LEFT INLINE so the model can see in the next
-// turn's context that the format wasn't honored.
-const askUserProtocol = `## Mosaic protocol: ask_user
+// We instead want claude to STOP the moment the failure arrives and
+// wait for the user's answer to surface as a fresh user turn (the
+// bridge injects the chosen option text via handlePollResponse). End
+// the current turn cleanly — no further tool calls, no preemptive
+// follow-up — so the next user turn lands on a clean conversational
+// boundary.
+const askUserDeferredProtocol = `## Mosaic protocol: AskUserQuestion is deferred
 
-When you need the user to pick from a small set of discrete options,
-output exactly this block (and nothing else around it that mimics it):
+When you call the AskUserQuestion tool, Mosaic intercepts it and
+renders the question as an interactive poll for the user. The tool
+itself fails with an error tool_result (Mosaic runs headless, no
+TTY) — this failure is EXPECTED and is NOT a signal to proceed
+without the user's answer.
 
-` + "```" + `
-<ask_user>
-your question on one line
-- option 1 text
-- option 2 text
-- option 3 text
-</ask_user>
-` + "```" + `
-
-Rules:
-- 2 to 10 options. Fewer than 2 = it's not a multiple-choice question, just ask plainly.
-- Each option on its own bullet line ("- " or "* ").
-- Mosaic strips this block from the visible reply and renders the question
-  as a native Matrix poll (Element shows it as click-to-vote buttons);
-  the user's pick becomes the next user turn verbatim.
-- Don't use this for yes/no — just ask in plain text.
-- Prefer this over the AskUserQuestion tool: that tool fails in Mosaic's
-  headless mode (no TTY), and Mosaic will surface the same poll UI if
-  it sees an AskUserQuestion call — but the model loses a turn waiting
-  on a failed tool_result. Just emit the envelope directly.
-- Don't paste this block inside other text or code fences — it must be
-  at the top level of your reply.`
+On seeing the AskUserQuestion error tool_result:
+- Do NOT call any further tools in this turn.
+- Do NOT speculate, retry, or proceed with assumed defaults.
+- End the turn immediately with at most a single short
+  acknowledgement (e.g. "等你的选择" / "waiting for your pick"),
+  or end silently — either is fine.
+- The user's choice arrives later as a regular user message
+  containing the picked option's text verbatim. Treat that as the
+  answer to the question and resume work from there.`
 
 // parseAskUserQuestionTool decodes the AskUserQuestion tool_use input
 // into an askUser. Only the first question is rendered today
@@ -373,7 +350,7 @@ func parseAskUserQuestionTool(raw json.RawMessage) (askUser, bool) {
 			continue
 		}
 		opts = append(opts, o.Label)
-		if len(opts) >= 10 { // matches the <ask_user> envelope 10-option cap
+		if len(opts) >= 10 { // poll UI caps at 10 buttons
 			break
 		}
 	}
@@ -383,105 +360,11 @@ func parseAskUserQuestionTool(raw json.RawMessage) (askUser, bool) {
 	return askUser{question: q.Question, options: opts}, true
 }
 
-// askUser captures one parsed prompt — either a text `<ask_user>`
-// envelope or an `AskUserQuestion` tool_use. toolUseID is set only
-// for the tool-use flavour; it's carried into pendingAsk so the
-// bridge can suppress the SDK's auto-generated error tool_result for
-// the same id (see Bridge.isInterceptedAskToolUseID).
+// askUser captures one parsed prompt from an `AskUserQuestion`
+// tool_use. Feeds the poll renderer.
 type askUser struct {
-	question  string
-	options   []string
-	toolUseID string
-}
-
-// extractAskUserBlocks pulls every <ask_user>...</ask_user> block out
-// of text and returns (cleaned text, parsed asks). Quiet on malformed
-// blocks (no closer / fewer than 2 options): the block is left inline
-// and no ask is parsed, so the model sees its own output in the next
-// turn's context as a hint that the protocol wasn't honored.
-//
-// Expected block format (1-indented list, dash bullets, ≤ 10 options):
-//
-//	<ask_user>
-//	question text on one line
-//	- option A
-//	- option B
-//	- option C
-//	</ask_user>
-func extractAskUserBlocks(text string) (string, []askUser) {
-	const open = "<ask_user>"
-	const close = "</ask_user>"
-	var (
-		asks  []askUser
-		out   strings.Builder
-		head  = 0
-	)
-	for {
-		i := strings.Index(text[head:], open)
-		if i < 0 {
-			out.WriteString(text[head:])
-			break
-		}
-		startBlock := head + i
-		j := strings.Index(text[startBlock:], close)
-		if j < 0 {
-			// Unterminated — give up parsing further blocks.
-			out.WriteString(text[head:])
-			break
-		}
-		endBlock := startBlock + j + len(close)
-		raw := text[startBlock+len(open) : startBlock+j]
-		if a, ok := parseAskBlock(raw); ok {
-			out.WriteString(text[head:startBlock])
-			asks = append(asks, a)
-		} else {
-			// Keep the malformed block visible so the user / next turn
-			// can see what went wrong.
-			out.WriteString(text[head:endBlock])
-		}
-		head = endBlock
-	}
-	cleaned := strings.TrimSpace(out.String())
-	return cleaned, asks
-}
-
-// parseAskBlock parses the inner body of an <ask_user> block. Returns
-// ok=false when the block has fewer than 2 options or no question
-// line — both signal "model didn't follow the format, leave it
-// inline."
-func parseAskBlock(raw string) (askUser, bool) {
-	var (
-		question string
-		options  []string
-	)
-	for _, line := range strings.Split(raw, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		// Option lines: "- text" or "* text". Anything else is the
-		// question (only the first such line is kept; extras are
-		// folded into the question with spaces).
-		if strings.HasPrefix(line, "- ") || strings.HasPrefix(line, "* ") {
-			opt := strings.TrimSpace(line[2:])
-			if opt != "" {
-				options = append(options, opt)
-			}
-			continue
-		}
-		if question == "" {
-			question = line
-		} else {
-			question += " " + line
-		}
-	}
-	if question == "" || len(options) < 2 {
-		return askUser{}, false
-	}
-	if len(options) > 10 {
-		options = options[:10]
-	}
-	return askUser{question: question, options: options}, true
+	question string
+	options  []string
 }
 
 // renderAskUser posts the prompt as a native Matrix poll
@@ -507,9 +390,8 @@ func (t *turn) renderAskUser(ctx context.Context, a askUser) {
 	}
 	t.b.mu.Lock()
 	t.b.pendingAsks[t.roomID] = &pendingAsk{
-		eventID:   evID,
-		options:   a.options,
-		toolUseID: a.toolUseID,
+		eventID: evID,
+		options: a.options,
 	}
 	t.b.mu.Unlock()
 }
@@ -530,37 +412,12 @@ func askOptionIndex(id string) int {
 	return n
 }
 
-// isInterceptedAskToolUseID reports whether toolUseID belongs to an
-// AskUserQuestion tool_use we currently have an open reactions
-// picker for. Used to suppress the SDK's auto-generated error
-// tool_result (it fires in headless mode before the user reacts).
-//
-// O(rooms-with-open-picker). At any moment that's typically zero or
-// one, so a linear scan over pendingAsks is fine.
-func (b *Bridge) isInterceptedAskToolUseID(toolUseID string) bool {
-	if toolUseID == "" {
-		return false
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for _, pa := range b.pendingAsks {
-		if pa.toolUseID == toolUseID {
-			return true
-		}
-	}
-	return false
-}
-
-
 // handlePollResponse is the org.matrix.msc3381.poll.response handler.
 // Resolves the pending ask in roomID, closes the poll so Element
 // greys out the buttons, and injects the chosen option as a fresh
 // user turn. First valid response wins.
 func (b *Bridge) handlePollResponse(ctx context.Context, roomID id.RoomID, pollStartID id.EventID, sender id.UserID, answerIDs []string) {
 	if len(answerIDs) == 0 {
-		return
-	}
-	if !b.isAllowed(sender) {
 		return
 	}
 	idx := askOptionIndex(answerIDs[0])
@@ -761,25 +618,6 @@ func (b *Bridge) handleMessage(ctx context.Context, im matrix.IncomingMessage) {
 	}
 	isSlash := strings.HasPrefix(dispatch, "/")
 
-	// ACL: only admins + listed members may drive the agent. Read-only
-	// slash commands (/help / /status / list-style queries) bypass the
-	// gate so a stranger can at least see they're not authorized.
-	if !b.isAllowed(sender) && !(isSlash && isReadOnlySlash(dispatch)) {
-		log.Printf("[agent] denied: %s (not in admins/members)", sender)
-		// Belt-and-suspenders: never reply to a peer agent. The mention
-		// router above should already drop these, but if it ever fails
-		// open (e.g. Manager.List empty during startup) the denial reply
-		// becomes ping-pong fuel between two unallowlisted bots.
-		if !b.isPeerAgent(sender) {
-			_, _ = b.mx.SendText(context.Background(), roomID, fmt.Sprintf(
-				"🔒 你（%s）不在本 agent 的访问名单。请联系管理员（%s）加白：`/agent allow %s`",
-				FoldHomeServer(string(sender), b.opts.ServerName),
-				strings.Join(b.opts.Admins, ", "),
-				FoldHomeServer(string(sender), b.opts.ServerName)))
-		}
-		return
-	}
-
 	if isSlash {
 		if handled := b.handleSlash(roomID, sender, dispatch); handled {
 			return
@@ -839,24 +677,6 @@ func (b *Bridge) cancelPendingAsk(ctx context.Context, roomID id.RoomID, reason 
 	}
 }
 
-// isReadOnlySlash returns true for slashes any room member is allowed
-// to invoke (queries / help, no state mutation, no claude spawn).
-// Anything else (claude turns + state-mutating slashes) requires
-// isAllowed.
-func isReadOnlySlash(text string) bool {
-	cmd := strings.TrimSpace(text)
-	if i := strings.IndexAny(cmd, " \t"); i > 0 {
-		cmd = cmd[:i]
-	}
-	switch cmd {
-	case "/help", "/status", "/agent", "/project":
-		// /agent and /project sub-dispatch their own ACL — list/help
-		// is fine; mutating subs (new / cwd / allow) re-check.
-		return true
-	}
-	return false
-}
-
 // handleSlash returns true when the input was a recognized slash
 // command. Unknown / commands fall through to claude (they may be
 // claude's own slash commands like /clear).
@@ -912,6 +732,9 @@ func (b *Bridge) handleSlash(roomID id.RoomID, sender id.UserID, text string) bo
 		}
 		_ = b.mx.DeleteUserRoomTag(context.Background(), roomID, "m.lowpriority")
 		_, _ = b.mx.SendText(ctx, roomID, "🌅 已唤醒。bot 恢复响应；下一条消息会基于 SUMMARY.md（如有）开新会话。")
+		return true
+	case "/export":
+		b.handleExportSlash(ctx, roomID, sender, rest)
 		return true
 	case "/compact":
 		// Mark room as "save next turn body to SUMMARY.md, then end
@@ -1003,76 +826,6 @@ func (b *Bridge) handleAgentSlash(ctx context.Context, roomID id.RoomID, sender 
 			info.DeviceName, info.UserID, info.ID, info.ID, info.UserID))
 		return true
 
-	case "members":
-		// Show the current allow-list (admins + members). Anyone in
-		// the room can run this — useful for "why am I being denied?".
-		var sb strings.Builder
-		sb.WriteString("**访问名单**\n\n")
-		sb.WriteString("**Admins** (always allowed, can run /agent new etc.):\n")
-		for _, a := range b.opts.Admins {
-			fmt.Fprintf(&sb, "- `%s`\n", FoldHomeServer(a, b.opts.ServerName))
-		}
-		sb.WriteString("\n**Members** (allowed to drive agents, no admin power):\n")
-		members := b.opts.Members
-		if b.opts.Manager != nil {
-			members = b.opts.Manager.Members() // live config
-		}
-		if len(members) == 0 {
-			sb.WriteString("_(空 — 仅 admins 可用)_\n")
-		} else {
-			for _, m := range members {
-				fmt.Fprintf(&sb, "- `%s`\n", FoldHomeServer(m, b.opts.ServerName))
-			}
-		}
-		_, _ = b.mx.SendText(ctx, roomID, sb.String())
-		return true
-
-	case "allow":
-		if !b.isAdmin(sender) {
-			_, _ = b.mx.SendText(ctx, roomID, "⛔ `/agent allow` 需要管理员权限")
-			return true
-		}
-		if b.opts.Manager == nil {
-			_, _ = b.mx.SendText(ctx, roomID, "⚠️ manager unavailable")
-			return true
-		}
-		if rest == "" {
-			_, _ = b.mx.SendText(ctx, roomID, "用法：`/agent allow @user:server`（短形式 `@user` 也行）")
-			return true
-		}
-		uid := ExpandHomeServer(rest, b.opts.ServerName)
-		if err := b.opts.Manager.AddMember(uid); err != nil {
-			_, _ = b.mx.SendText(ctx, roomID, "❌ "+err.Error())
-			return true
-		}
-		_, _ = b.mx.SendText(ctx, roomID, fmt.Sprintf(
-			"✅ 已加白 `%s`，现在 ta 可以 @ 任意 agent 聊天 / 跑 `/new-session` 等。",
-			FoldHomeServer(uid, b.opts.ServerName)))
-		return true
-
-	case "revoke":
-		if !b.isAdmin(sender) {
-			_, _ = b.mx.SendText(ctx, roomID, "⛔ `/agent revoke` 需要管理员权限")
-			return true
-		}
-		if b.opts.Manager == nil {
-			_, _ = b.mx.SendText(ctx, roomID, "⚠️ manager unavailable")
-			return true
-		}
-		if rest == "" {
-			_, _ = b.mx.SendText(ctx, roomID, "用法：`/agent revoke @user:server`")
-			return true
-		}
-		uid := ExpandHomeServer(rest, b.opts.ServerName)
-		if err := b.opts.Manager.RemoveMember(uid); err != nil {
-			_, _ = b.mx.SendText(ctx, roomID, "❌ "+err.Error())
-			return true
-		}
-		_, _ = b.mx.SendText(ctx, roomID, fmt.Sprintf(
-			"✅ 已从白名单移除 `%s`",
-			FoldHomeServer(uid, b.opts.ServerName)))
-		return true
-
 	default:
 		_, _ = b.mx.SendText(ctx, roomID,
 			"未知子命令 `"+subcmd+"`。试 `/agent help`。")
@@ -1085,28 +838,6 @@ func (b *Bridge) isAdmin(sender id.UserID) bool {
 		if a == string(sender) {
 			return true
 		}
-	}
-	return false
-}
-
-// isAllowed = admin OR explicitly listed in Members OR a peer agent
-// in our fleet. Peer agents are trusted infrastructure (we run them);
-// requiring them to be on each other's Members list defeats inter-
-// agent collaboration. The mention router already ensures peer
-// messages only land here when they explicitly @-mentioned us, so
-// open-ended bot spam is bounded by that gate, not this one.
-func (b *Bridge) isAllowed(sender id.UserID) bool {
-	if b.isAdmin(sender) {
-		return true
-	}
-	s := string(sender)
-	for _, m := range b.opts.Members {
-		if m == s {
-			return true
-		}
-	}
-	if b.isPeerAgent(sender) {
-		return true
 	}
 	return false
 }
@@ -1408,6 +1139,25 @@ func (b *Bridge) handleProjectSlash(ctx context.Context, roomID id.RoomID, sende
 			_, _ = b.mx.SendText(ctx, roomID, "用法：`/project cwd /path/to/project`")
 			return true
 		}
+		// Auto-create the directory if missing — saves a "ssh in + mkdir"
+		// trip when bootstrapping a new project. Resolve ~ first so we
+		// don't try to mkdir a literal "~"; the config keeps the
+		// unexpanded form so it stays portable across hosts.
+		abs := expandHome(rest)
+		if info, err := os.Stat(abs); err != nil {
+			if !os.IsNotExist(err) {
+				_, _ = b.mx.SendText(ctx, roomID, "❌ 检查路径失败："+err.Error())
+				return true
+			}
+			if err := os.MkdirAll(abs, 0o755); err != nil {
+				_, _ = b.mx.SendText(ctx, roomID, "❌ 创建目录失败："+err.Error())
+				return true
+			}
+			_, _ = b.mx.SendText(ctx, roomID, "📁 已创建目录 `"+abs+"`")
+		} else if !info.IsDir() {
+			_, _ = b.mx.SendText(ctx, roomID, "❌ 路径已存在但不是目录：`"+abs+"`")
+			return true
+		}
 		return b.applyProjectMutation(ctx, roomID, "", rest, "")
 
 	case "name":
@@ -1651,9 +1401,6 @@ const agentSlashHelp = `**` + "`/agent`" + ` 命令家族**
 
 - ` + "`/agent list`" + ` — 列出所有已配置 agent + 在线状态
 - ` + "`/agent new <localpart> [display name]`" + ` — 创建新 agent（注册 Matrix 账号 + 写 config + 即时上线 + 创建 ` + "`MEMORY.md`" + ` 模板）⛔ admin only
-- ` + "`/agent members`" + ` — 显示访问名单（admins + members）
-- ` + "`/agent allow @user`" + ` — 加白：让该用户可以驱动 agent（claude 对话 + tier-2 slashes）⛔ admin only
-- ` + "`/agent revoke @user`" + ` — 从白名单移除 ⛔ admin only
 - ` + "`/agent help`" + ` — 这条帮助
 
 新 agent 的 ` + "`MEMORY.md`" + ` 是其 persona / role：
@@ -1677,6 +1424,7 @@ const slashHelp = `**可用命令**
 - ` + "`/status`" + ` — 显示当前 room 的 session id / project / cwd
 - ` + "`/agent`" + ` — agent 管理（list / new …）— 见 ` + "`/agent help`" + `
 - ` + "`/project`" + ` — project 管理（status / cwd / name …）— 见 ` + "`/project help`" + `
+- ` + "`/export`" + ` — admin-gated。把所有 agent 能看到的 room 历史解密后落盘到 ` + "`<data>/exports/`" + `，JSONL 格式，断点续传。后台运行，进度在原消息里 edit 更新
 - ` + "`/help`" + ` — 这条帮助
 
 > Element web 对 ` + "`/`" + ` 起头的未知命令会弹 "Unknown Command" 提示——回车或点 Send as message 即可发出。
@@ -2041,37 +1789,9 @@ func (t *turn) consume(ctx context.Context, ev runtime.Event) bool {
 		return false
 
 	case runtime.TextFinal:
-		// Extract any ask_user protocol block before finalizing — the
-		// raw <ask_user> envelope is bridge plumbing and shouldn't
-		// reach the user. Two paths:
-		//   - Some prose remains around the envelope → finalize with
-		//     the cleaned body (Element edits the streamed bubble).
-		//   - The reply was nothing but the envelope → redact the
-		//     streamed bubble so only the rendered question card
-		//     stays visible. finalizeText("") can't help here: it's
-		//     guarded against blank canonical, and even if we passed
-		//     a single space the empty bubble is uglier than a clean
-		//     redact.
-		body, asks := extractAskUserBlocks(e.Body)
-		if len(asks) > 0 && strings.TrimSpace(body) == "" && t.textEvent != "" {
-			if err := t.b.mx.Redact(ctx, t.roomID, t.textEvent, "ask_user envelope"); err != nil {
-				log.Printf("[agent] redact ask-only streamed bubble failed: %v", err)
-				// Fallback: edit to a single space so the raw block at
-				// least doesn't shout. Element renders this as a thin
-				// empty bubble — strictly less bad than leaving the
-				// envelope inline.
-				_ = t.b.mx.EditText(ctx, t.roomID, t.textEvent, " ")
-			}
-			t.textEvent = ""
-			t.pending.Reset()
-			t.lastFlushed = ""
-			t.lastFinalText = ""
-		} else {
-			t.finalizeText(ctx, body)
-		}
-		for _, ask := range asks {
-			t.renderAskUser(ctx, ask)
-		}
+		// Finalize whatever was streaming with the canonical body
+		// (deltas should agree but TextFinal is authoritative).
+		t.finalizeText(ctx, e.Body)
 		return false
 
 	case runtime.Thinking:
@@ -2084,13 +1804,12 @@ func (t *turn) consume(ctx context.Context, ev runtime.Event) bool {
 		t.toolCount++
 		// AskUserQuestion: intercept and render as a native Matrix
 		// poll instead of a plain tool_use bubble. The SDK still
-		// auto-fails the deferred tool with an error tool_result
-		// (suppressed via isInterceptedAskToolUseID); the user's
-		// vote arrives via handlePollResponse and is injected as a
-		// fresh user turn.
+		// auto-fails the deferred tool with an error tool_result —
+		// silently dropped by the runtime.ToolResult branch above
+		// (all tool errors are suppressed). The user's vote arrives
+		// via handlePollResponse and is injected as a fresh user turn.
 		if e.Name == "AskUserQuestion" {
 			if ask, ok := parseAskUserQuestionTool(e.Input); ok {
-				ask.toolUseID = e.ID
 				t.refreshTypingIfStale(ctx)
 				t.renderAskUser(ctx, ask)
 				return false
@@ -2108,27 +1827,10 @@ func (t *turn) consume(ctx context.Context, ev runtime.Event) bool {
 		return false
 
 	case runtime.ToolResult:
-		if !e.IsError {
-			return false
-		}
-		// Swallow the SDK's auto-failure of an AskUserQuestion we
-		// intercepted: in headless stream-json mode the SDK falls
-		// back to an error tool_result before the user has any
-		// chance to click a reaction. The user-visible UX is the
-		// reactions picker we rendered alongside the tool_use, and
-		// the model will get a real answer when the user replies.
-		if t.b.isInterceptedAskToolUseID(e.ToolUseID) {
-			return false
-		}
-		name := e.ToolName
-		if name == "" {
-			name = "tool"
-		}
-		body := FormatToolResult(name, e.Content, true)
-		if body != "" {
-			t.refreshTypingIfStale(ctx)
-			_, _ = t.b.mx.SendText(ctx, t.roomID, body)
-		}
+		// Tool results are entirely internal to the model loop —
+		// success is implicit and errors are noise (the agent's own
+		// next-turn text usually explains what happened in plain
+		// language). Suppress everything.
 		return false
 
 	case runtime.ImageFinal:
@@ -2211,13 +1913,13 @@ func (b *Bridge) getOrCreate(ctx context.Context, roomID id.RoomID) *roomSession
 		// re-injecting an outdated SUMMARY.md would confuse it.
 		appendSP = b.opts.Memory.SystemPrompt(r.SpaceID, roomID)
 	}
-	// askUserProtocol is always appended (including on resume) so the
-	// runtime always knows the convention even after long-running
-	// sessions where the original directive may have aged out.
+	// askUserDeferredProtocol is always appended (incl. resume) — short
+	// enough not to be costly, and the directive is easy to age out of
+	// long-running conversations otherwise.
 	if appendSP != "" {
 		appendSP += "\n\n"
 	}
-	appendSP += askUserProtocol
+	appendSP += askUserDeferredProtocol
 	rt := b.opts.Runtime
 	if rt == "" {
 		rt = "claude"
@@ -2319,6 +2021,116 @@ func (b *Bridge) observeSessionID(s *roomSession) {
 	// This goroutine exists as a placeholder for future per-session
 	// background work (heartbeats / health checks).
 	_ = s
+}
+
+// handleExportSlash kicks off a fleet-wide history export in the
+// background and edits a single status message in place as work
+// progresses. Admin-gated. Multiple concurrent /export invocations
+// are not prevented — they share OutDir, and per-room state.json
+// resumes safely; the worst case is two goroutines updating the
+// same status message.
+func (b *Bridge) handleExportSlash(ctx context.Context, roomID id.RoomID, sender id.UserID, args string) {
+	_ = args // no flags in v1
+	if !b.isAdmin(sender) {
+		_, _ = b.mx.SendText(ctx, roomID,
+			fmt.Sprintf("⛔ `/export` 需要管理员权限。当前 admins: %v", b.opts.Admins))
+		return
+	}
+	if b.opts.Manager == nil {
+		_, _ = b.mx.SendText(ctx, roomID, "⚠️ manager unavailable in this build")
+		return
+	}
+	clients := b.opts.Manager.Clients()
+	if len(clients) == 0 {
+		_, _ = b.mx.SendText(ctx, roomID, "⚠️ 当前没有在线 agent —— 没法做历史拉取")
+		return
+	}
+	if b.opts.DataDir == "" {
+		_, _ = b.mx.SendText(ctx, roomID, "⚠️ DataDir 未配置，无法决定导出路径")
+		return
+	}
+	outDir := filepath.Join(b.opts.DataDir, "exports")
+
+	agentIDs := make([]string, 0, len(clients))
+	for id := range clients {
+		agentIDs = append(agentIDs, id)
+	}
+	statusBody := fmt.Sprintf(
+		"🗂️ **导出已启动**\n\n- 输出目录: `%s`\n- 参与 agent: %v\n- 状态: 枚举 room 中...",
+		outDir, agentIDs)
+	statusEvent, err := b.mx.SendText(ctx, roomID, statusBody)
+	if err != nil {
+		log.Printf("[agent] /export status send: %v", err)
+		return
+	}
+
+	// Detach from the inbound ctx — that one's per-message and will
+	// be cancelled after handleMessage returns. Use background so the
+	// export survives the slash invocation.
+	go func() {
+		bg := context.Background()
+		startedAt := time.Now()
+		var (
+			mu       sync.Mutex
+			done     int
+			events   int
+			failed   int
+			lastEdit time.Time
+		)
+		editProgress := func(force bool) {
+			mu.Lock()
+			defer mu.Unlock()
+			if !force && time.Since(lastEdit) < 2*time.Second {
+				return
+			}
+			lastEdit = time.Now()
+			body := fmt.Sprintf(
+				"🗂️ **导出进行中**\n\n- 输出目录: `%s`\n- 完成 room: **%d**\n- 已写事件: **%d**\n- 解密失败: **%d**\n- 经过: %s",
+				outDir, done, events, failed, time.Since(startedAt).Round(time.Second))
+			if err := b.mx.EditText(bg, roomID, statusEvent, body); err != nil {
+				log.Printf("[agent] /export edit progress: %v", err)
+			}
+		}
+
+		exp, err := export.New(export.Options{
+			OutDir:  outDir,
+			Clients: clients,
+			RoomDone: func(rs export.RoomSummary) {
+				mu.Lock()
+				done++
+				events += rs.EventCount
+				failed += rs.FailedCount
+				mu.Unlock()
+				editProgress(false)
+			},
+		})
+		if err != nil {
+			_ = b.mx.EditText(bg, roomID, statusEvent,
+				fmt.Sprintf("❌ 导出初始化失败: %v", err))
+			return
+		}
+		summary, runErr := exp.Run(bg)
+		// Final edit — always force so the last RoomDone tick that
+		// got throttled isn't the user's last view.
+		var finalBody strings.Builder
+		if runErr != nil {
+			fmt.Fprintf(&finalBody,
+				"⚠️ **导出结束（带错误）**: %v\n\n", runErr)
+		} else {
+			finalBody.WriteString("✅ **导出完成**\n\n")
+		}
+		fmt.Fprintf(&finalBody,
+			"- 输出目录: `%s`\n- 总 room: **%d**\n- 总事件: **%d**\n- 解密失败: **%d**\n- 总耗时: %s\n- manifest: `%s/manifest.json`",
+			outDir, summary.TotalRooms, summary.TotalEvents, summary.TotalFailed,
+			summary.Duration.Round(time.Second), outDir)
+		if summary.TotalFailed > 0 {
+			fmt.Fprintf(&finalBody,
+				"\n\n> 解密失败的 event 落到各 room 的 `failed.jsonl`。原因通常是本 agent 在该 event 写入时还没加入房间 / 没拿到 megolm key。可以让其他 agent 加入后再跑一次 /export，会自动 retry。")
+		}
+		if err := b.mx.EditText(bg, roomID, statusEvent, finalBody.String()); err != nil {
+			log.Printf("[agent] /export final edit: %v", err)
+		}
+	}()
 }
 
 // ----- helpers -----
