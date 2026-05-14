@@ -51,10 +51,11 @@ design point).
 whose target is itself a Space (i.e. a project Space created under an
 existing Org Space), the bridge fires `EnsureProject` (insert-if-absent
 keyed by Space ID, default name = the Space's `m.room.name`) and the
-winning agent creates a `welcome` topic-room as the first child. Multi-
-agent races are resolved by `EnsureProject` returning `created=true`
-exactly once. Direct invites to a top-level Space don't trigger this —
-only the auto-join-from-parent path.
+winning agent creates the default topic-rooms (`git`, `deploy`, `bugs`,
+`feature`, `test` — see `defaultProjectRooms` in `pkg/agent/agent.go`)
+as children. Multi-agent races are resolved by `EnsureProject` returning
+`created=true` exactly once. Direct invites to a top-level Space don't
+trigger this — only the auto-join-from-parent path.
 
 ## Core data model
 

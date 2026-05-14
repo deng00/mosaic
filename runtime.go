@@ -308,7 +308,7 @@ func (r *AgentRuntime) Projects() []agent.ProjectInfo {
 // "insert if absent": returns created=true only when no entry existed
 // for spaceID before this call, so concurrent observers of the same
 // new Space can pick a single winner for one-shot side effects like
-// creating a welcome room.
+// creating the default rooms.
 func (r *AgentRuntime) EnsureProject(spaceID, name string) (bool, error) {
 	if spaceID == "" {
 		return false, fmt.Errorf("spaceID required")

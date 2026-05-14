@@ -95,11 +95,14 @@ type Options struct {
 	// and /agent new. nil → those slash commands report "unavailable".
 	Manager AgentManager
 
-	// Admins are full Matrix user IDs allowed to run management
-	// commands (`/agent new`, `/project cwd`, `/export`, …). Any other
-	// Matrix room member can chat with the agent normally — Matrix
-	// room invites are the membership gate, Admins is only about
-	// "who can mutate config / fleet state from chat".
+	// Admins are full Matrix user IDs allowed to interact with the bot
+	// at all. Two things at once:
+	//   1. only admins (and peer agents in the fleet) can chat with
+	//      the bot — everyone else's messages are silently dropped at
+	//      handleMessage entry.
+	//   2. mutating slash commands (`/agent new`, `/project cwd`,
+	//      `/export`, …) are gated to admins; peer-agent senders pass
+	//      the gate-1 check but still can't run admin-only slashes.
 	Admins []string
 
 	// Env is extra KEY=VALUE pairs injected into every spawned
@@ -466,9 +469,8 @@ func (b *Bridge) handlePollResponse(ctx context.Context, roomID id.RoomID, pollS
 
 // handleSpaceJoined runs after the bot auto-joins a fresh sub-Space
 // (a child Space of an existing Space the bot is in). Auto-join has
-// no human "trigger" to invite to welcome — passes "" so the welcome
-// room exists as a Space child only, visible after the user joins
-// the Space in Element.
+// no human "trigger" — passes "" so the default rooms exist as Space
+// children only, visible after the user joins the Space in Element.
 func (b *Bridge) handleSpaceJoined(ctx context.Context, parentSpace, newSpace id.RoomID, spaceName string) {
 	b.handleSpaceJoinedWithInvite(ctx, parentSpace, newSpace, spaceName, "")
 }
@@ -479,11 +481,11 @@ func (b *Bridge) handleSpaceJoined(ctx context.Context, parentSpace, newSpace id
 //  1. EnsureProject inserts a project entry keyed by the new Space's
 //     ID, defaulting the project name to the Space's m.room.name.
 //     Only the first agent to win the race gets created=true.
-//  2. The winning agent creates a "welcome" topic-room as a child of
-//     the new Space and posts a short bootstrap message. Other agents
-//     no-op so we don't end up with multiple welcome rooms.
+//  2. The winning agent creates the default topic-rooms (see
+//     defaultProjectRooms) as children of the new Space. Other agents
+//     no-op so we don't end up with duplicate rooms.
 //
-// inviteUser is the human who should be pinged into the welcome room
+// inviteUser is the human who should be pinged into the default rooms
 // directly (the /project new caller). Pass "" for the auto-join path
 // where there's no specific caller.
 //
@@ -504,7 +506,7 @@ func (b *Bridge) handleSpaceJoinedWithInvite(ctx context.Context, parentSpace, n
 	}
 	if !created {
 		// Another agent (or a prior run) already initialised this
-		// Space. Nothing to do — welcome room, if any, was their job.
+		// Space. Nothing to do — default rooms, if any, were their job.
 		return
 	}
 	log.Printf("[agent] auto-initialised project for sub-space %s (name=%q, parent=%s)",
@@ -515,42 +517,48 @@ func (b *Bridge) handleSpaceJoinedWithInvite(ctx context.Context, parentSpace, n
 		invites = []id.UserID{inviteUser}
 	}
 
-	roomID, err := b.mx.CreateRoom(ctx, matrix.CreateRoomOpts{
-		Name:             "welcome",
-		Topic:            "🎉 " + defaultName + " — 起步房间",
-		ParentSpace:      newSpace,
-		Invite:           invites,
-		Preset:           "private_chat",
-		StrictParentLink: true,
-	})
-	if err != nil {
-		log.Printf("[agent] welcome room creation in space %s failed: %v", newSpace, err)
-		// Most common cause: bot lacks PL 50 in the new sub-Space, so
-		// linking m.space.child fails. Surface a hint in the parent
-		// Org Space (where the bot was originally invited and likely
-		// has higher PL — at least the user is watching it) so the
-		// user knows what to do next. Best-effort.
-		hint := fmt.Sprintf(
-			"⚠️ 在新 Space **%s** 里建 welcome room 失败：我在该 Space 没有足够权限"+
-				"（需要 Moderator / PL 50 才能挂 child room）。\n\n"+
-				"在 Element 里把我提为 Moderator，再重新创建一次该 Space 就会自动建 welcome room。",
-			defaultName)
-		if _, sendErr := b.mx.SendText(ctx, parentSpace, hint); sendErr != nil {
-			log.Printf("[agent] welcome failure hint send to %s failed: %v", parentSpace, sendErr)
+	for _, r := range defaultProjectRooms {
+		_, err := b.mx.CreateRoom(ctx, matrix.CreateRoomOpts{
+			Name:             r.name,
+			Topic:            r.topic,
+			ParentSpace:      newSpace,
+			Invite:           invites,
+			Preset:           "private_chat",
+			StrictParentLink: true,
+		})
+		if err != nil {
+			log.Printf("[agent] default room %q in space %s failed: %v", r.name, newSpace, err)
+			// Most common cause: bot lacks PL 50 in the new sub-Space, so
+			// linking m.space.child fails. Surface a hint in the parent
+			// Org Space (where the bot was originally invited and likely
+			// has higher PL — at least the user is watching it) so the
+			// user knows what to do next. Best-effort. Bail on the first
+			// failure since PL issues will affect every subsequent room.
+			hint := fmt.Sprintf(
+				"⚠️ 在新 Space **%s** 里建默认 room `%s` 失败：我在该 Space 没有足够权限"+
+					"（需要 Moderator / PL 50 才能挂 child room）。\n\n"+
+					"在 Element 里把我提为 Moderator，再重新创建一次该 Space 就会自动建好默认 rooms。",
+				defaultName, r.name)
+			if _, sendErr := b.mx.SendText(ctx, parentSpace, hint); sendErr != nil {
+				log.Printf("[agent] default-room failure hint send to %s failed: %v", parentSpace, sendErr)
+			}
+			return
 		}
-		return
 	}
-	greeting := fmt.Sprintf(
-		"👋 欢迎来到 **%s**！\n\n"+
-			"这个 room 由 mosaic 自动建好作为项目起步入口。常用动作：\n\n"+
-			"- `/project status` — 查当前 Space / cwd\n"+
-			"- `/project cwd <path>` — 设置工作目录（admin）\n"+
-			"- `/project name <name>` — 改项目名（admin）\n"+
-			"- 在 Space 下再开 topic room 即可分线协作\n",
-		defaultName)
-	if _, err := b.mx.SendText(ctx, roomID, greeting); err != nil {
-		log.Printf("[agent] welcome message send to %s failed: %v", roomID, err)
-	}
+}
+
+// defaultProjectRooms is the canonical set of topic rooms created
+// inside a freshly-initialised project Space. Order is the order they
+// appear under the Space in Element.
+var defaultProjectRooms = []struct {
+	name  string
+	topic string
+}{
+	{"git", "代码提交 / PR / 分支讨论"},
+	{"deploy", "部署 / CI/CD / 发布"},
+	{"bugs", "bug 报告与跟踪"},
+	{"feature", "功能开发讨论"},
+	{"test", "测试与 QA"},
 }
 
 // roomSession is the per-room state: a long-lived claude process and
@@ -586,6 +594,16 @@ func (b *Bridge) handleMessage(ctx context.Context, im matrix.IncomingMessage) {
 		log.Printf("[agent] %s in %s: %s (+%d attachment)", sender, roomID, truncate(text, 80), len(im.Attachments))
 	} else {
 		log.Printf("[agent] %s in %s: %s", sender, roomID, truncate(text, 80))
+	}
+
+	// Sender allowlist: only configured admins and peer agents in our
+	// fleet are allowed to drive the bot. Everyone else is silently
+	// dropped (no chat-visible refusal — avoid leaking presence and
+	// avoid bot-to-stranger loops). Matrix-layer self-echo filter
+	// already handles `sender == me` upstream.
+	if !b.isAdmin(sender) && !b.isPeerAgent(sender) {
+		log.Printf("[agent] drop %s in %s: not admin/peer-agent", sender, roomID)
+		return
 	}
 
 	// Multi-agent routing: in a room with several agents, route by
@@ -1180,7 +1198,7 @@ func (b *Bridge) handleProjectSlash(ctx context.Context, roomID id.RoomID, sende
 			_, _ = b.mx.SendText(ctx, roomID,
 				"用法：`/project new <project-name>`\n\n"+
 					"机制：bot 直接建一个子 Space（bot 是 creator，PL 100），挂在当前所在的 Org Space 下，"+
-					"自动建 welcome room。在 Org Space 自身的 timeline 里发也行。")
+					"自动建默认 rooms（git / deploy / bugs / feature / test）。在 Org Space 自身的 timeline 里发也行。")
 			return true
 		}
 		return b.handleProjectNew(ctx, roomID, sender, rest)
@@ -1206,6 +1224,28 @@ func (b *Bridge) applyProjectMutation(ctx context.Context, roomID id.RoomID, nam
 		return true
 	}
 	spaceID := string(parents[0])
+
+	// Setting cwd on a project that has no name yet ⇒ derive a name
+	// from the cwd's last path component (e.g. `/srv/work/argus` →
+	// "argus"). Saves an extra `/project name` round-trip for the
+	// common case of "first-time setup just gave me a path". Only
+	// fills when the existing name is blank; an explicit name passed
+	// in this call wins as usual.
+	if name == "" && cwd != "" {
+		existing := ""
+		for _, p := range b.opts.Manager.Projects() {
+			if p.SpaceID == spaceID {
+				existing = p.Name
+				break
+			}
+		}
+		if existing == "" {
+			if base := filepath.Base(strings.TrimRight(expandHome(cwd), "/")); base != "" && base != "." && base != "/" {
+				name = base
+			}
+		}
+	}
+
 	if err := b.opts.Manager.SetProject(spaceID, name, cwd, model); err != nil {
 		_, _ = b.mx.SendText(ctx, roomID, "❌ 写 config 失败："+err.Error())
 		return true
@@ -1228,7 +1268,7 @@ func (b *Bridge) applyProjectMutation(ctx context.Context, roomID id.RoomID, nam
 
 // handleProjectNew creates a fresh sub-Space owned by the bot under the
 // current room's parent Org Space, then runs the standard space-joined
-// init flow (EnsureProject + welcome room). Doing it bot-side dodges
+// init flow (EnsureProject + default rooms). Doing it bot-side dodges
 // the PL-50 cliff that hits Element-created sub-Spaces: the bot is
 // the Space creator → PL 100 → all subsequent state ops succeed.
 //
@@ -1240,11 +1280,24 @@ func (b *Bridge) applyProjectMutation(ctx context.Context, roomID id.RoomID, nam
 // candidate has sufficient PL — the resulting orphan-from-org Space
 // is still usable, just not visible under the Org tree.
 func (b *Bridge) handleProjectNew(ctx context.Context, roomID id.RoomID, sender id.UserID, name string) bool {
-	parentSpace := b.resolveProjectParent(ctx, roomID)
-	if parentSpace == "" {
+	parentSpace, topmost, err := b.resolveProjectParent(ctx, roomID)
+	if err != nil {
+		_, _ = b.mx.SendText(ctx, roomID, "❌ 解析父 Space 失败："+err.Error())
+		return true
+	}
+	if parentSpace == "" && topmost == "" {
 		_, _ = b.mx.SendText(ctx, roomID,
 			"⚠️ 当前 room 不在任何 Space 下，无法决定要把新 project 挂到哪。"+
 				"在某个 Org Space 下的 room 里跑这条命令，或直接在 Org Space 的 timeline 里发。")
+		return true
+	}
+	if parentSpace == "" {
+		_, _ = b.mx.SendText(ctx, roomID, fmt.Sprintf(
+			"⛔ 我在父 Space `%s` 里不是 Moderator/Admin（PL < 50），无法在它下面建子 Space。\n\n"+
+				"在 Element 里打开那个 Space → 右上角 People → 找到我（`%s`）→ Promote 到 **Moderator**（PL 50）或 **Admin**（PL 100），然后重试 `/project new %s`。",
+			FoldHomeServer(string(topmost), b.opts.ServerName),
+			FoldHomeServer(string(b.mx.UserID()), b.opts.ServerName),
+			name))
 		return true
 	}
 
@@ -1256,9 +1309,9 @@ func (b *Bridge) handleProjectNew(ctx context.Context, roomID id.RoomID, sender 
 	log.Printf("[agent] /project new created sub-space %s (name=%q, parent=%s, link_err=%v)",
 		newSpace, name, parentSpace, parentLinkErr)
 
-	// Reuse the auto-init path: EnsureProject + welcome room. Bot is
+	// Reuse the auto-init path: EnsureProject + default rooms. Bot is
 	// PL 100 in newSpace so every state op inside succeeds. Forward
-	// `sender` as an extra invite so they get the welcome room ping
+	// `sender` as an extra invite so they get the default-room pings
 	// even though their newSpace invite is still pending. If the
 	// async OnSpaceJoined later fires for the same Space, EnsureProject
 	// returns created=false and the side effects no-op.
@@ -1269,38 +1322,47 @@ func (b *Bridge) handleProjectNew(ctx context.Context, roomID id.RoomID, sender 
 	fmt.Fprintf(&sb, "- space: `%s`\n", FoldHomeServer(string(newSpace), b.opts.ServerName))
 	fmt.Fprintf(&sb, "- parent: `%s`\n", FoldHomeServer(string(parentSpace), b.opts.ServerName))
 	if parentLinkErr != nil {
-		fmt.Fprintf(&sb, "\n⚠️ 但没能挂到父 Space 下（我在父 Space 没 PL 50）：%v\n\n"+
+		fmt.Fprintf(&sb, "\n⚠️ 但没能挂到父 Space 下（预检通过却写 child 失败，多半是瞬时错误）：%v\n\n"+
 			"新 Space 现在是顶级独立 Space，你在 Element 的 rooms 列表能看到。"+
-			"如果想挂回 Org Space 下，把我在父 Space 里提到 Moderator，再手动 add child。",
+			"在父 Space 里手动 add child 即可挂回去；或重试 `/project new`。",
 			parentLinkErr)
 	} else {
-		sb.WriteString("\n下面已自动建好 welcome room。")
+		sb.WriteString("\n下面已自动建好默认 rooms：`git` / `deploy` / `bugs` / `feature` / `test`。")
 	}
 	_, _ = b.mx.SendText(ctx, roomID, sb.String())
 	return true
 }
 
-// resolveProjectParent picks the best Space to nest a new project
-// Space under, given the room the user ran /project new from. BFS
-// walks the inverted m.space.child graph (built from every Space the
-// bot is joined to) up to the topmost ancestor and prefers the
-// highest one the bot has PL ≥ 50 in.
+// resolveProjectParent picks the Space to nest a new project Space
+// under, given the room the user ran /project new from. BFS walks the
+// inverted m.space.child graph (built from every Space the bot is
+// joined to) up to the topmost ancestor and prefers the highest one
+// the bot has PL ≥ 50 in.
 //
 // Why the inverse graph: most clients (Element specifically) only
 // publish m.space.child in parents, not m.space.parent in children.
 // Walking via ParentSpaces alone breaks at the first Element-added
 // nesting and never reaches the Org Space at the root.
 //
-// Falls back to the closest discovered ancestor on no PL match, and
-// to roomID itself when roomID is already a Space.
-func (b *Bridge) resolveProjectParent(ctx context.Context, roomID id.RoomID) id.RoomID {
+// Return contract:
+//   - parent != "" → a Space the bot has PL ≥ 50 in; safe to nest under.
+//   - parent == "", topmost == "" → no ancestor Spaces at all (room not
+//     in any Space). Caller should tell the user to run from inside a
+//     Space.
+//   - parent == "", topmost != "" → ancestors exist but the bot is not
+//     Moderator/Admin in any of them. topmost is the highest ancestor,
+//     surfaced so the caller can name the Space the user needs to
+//     promote the bot in. No silent fallback — promotion is mandatory.
+func (b *Bridge) resolveProjectParent(ctx context.Context, roomID id.RoomID) (parent, topmost id.RoomID, err error) {
 	if isSpace, _ := b.mx.IsSpace(ctx, roomID); isSpace {
-		return roomID
+		if pl, e := b.mx.MyPowerLevel(ctx, roomID); e == nil && pl >= 50 {
+			return roomID, roomID, nil
+		}
+		return "", roomID, nil
 	}
-	hierarchy, err := b.mx.SpaceHierarchy(ctx)
-	if err != nil {
-		log.Printf("[agent] resolveProjectParent: hierarchy scan failed: %v", err)
-		return ""
+	hierarchy, hErr := b.mx.SpaceHierarchy(ctx)
+	if hErr != nil {
+		return "", "", fmt.Errorf("hierarchy scan: %w", hErr)
 	}
 	visited := map[id.RoomID]bool{roomID: true}
 	frontier := []id.RoomID{roomID}
@@ -1320,23 +1382,23 @@ func (b *Bridge) resolveProjectParent(ctx context.Context, roomID id.RoomID) id.
 		frontier = next
 	}
 	if len(ancestors) == 0 {
-		return ""
+		return "", "", nil
 	}
 	// ancestors is BFS-ordered (closer first); iterate from the back
 	// to prefer the topmost Org Space when bot has PL there.
 	for i := len(ancestors) - 1; i >= 0; i-- {
-		if pl, err := b.mx.MyPowerLevel(ctx, ancestors[i]); err == nil && pl >= 50 {
-			return ancestors[i]
+		if pl, e := b.mx.MyPowerLevel(ctx, ancestors[i]); e == nil && pl >= 50 {
+			return ancestors[i], ancestors[i], nil
 		}
 	}
-	return ancestors[0]
+	return "", ancestors[len(ancestors)-1], nil
 }
 
 const projectSlashHelp = `**` + "`/project`" + ` 命令家族**
 
 - ` + "`/project status`" + ` — 显示当前 room 的 Space / project / cwd 解析结果
 - ` + "`/project list`" + ` — 列出所有已配置 project
-- ` + "`/project new <name>`" + ` — bot 自己建子 Space + welcome room（绕过 PL 50 限制）⛔ admin only
+- ` + "`/project new <name>`" + ` — bot 自己建子 Space + 默认 rooms（git/deploy/bugs/feature/test，绕过 PL 50 限制）⛔ admin only
 - ` + "`/project cwd <path>`" + ` — 给当前 room 所属 Space 设工作目录 ⛔ admin only
 - ` + "`/project name <name>`" + ` — 给当前 Space 起个人类可读的名字 ⛔ admin only
 - ` + "`/project help`" + ` — 这条帮助

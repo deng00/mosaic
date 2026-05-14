@@ -54,7 +54,7 @@ type AgentManager interface {
 	// EnsureProject inserts a Project entry for spaceID with the
 	// given name iff one doesn't already exist. Returns created=true
 	// only on first insert — used by the auto-init flow so that
-	// follow-on side effects (e.g. creating a "welcome" room) run
+	// follow-on side effects (e.g. creating default rooms) run
 	// exactly once even when several agents observe the new Space
 	// concurrently. Empty name is allowed; caller is responsible for
 	// deciding a fallback.
