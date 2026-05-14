@@ -23,11 +23,20 @@ import (
 func FormatToolUse(name string, input json.RawMessage) string {
 	switch name {
 	case "Bash":
+		// Body sent as m.emote (see Bridge.consume), so Element renders
+		// "* <agent> 🛠️ <description>". We surface only the description
+		// here — the actual command is internal housekeeping and the
+		// user doesn't need to read it. Falls back to "Bash" when the
+		// description field is empty (rare; Claude Code normally fills
+		// it in).
 		var v struct {
-			Command string `json:"command"`
+			Description string `json:"description"`
 		}
 		_ = json.Unmarshal(input, &v)
-		return "🛠️ **Bash**  \n`" + truncate(oneLine(v.Command), 200) + "`"
+		if v.Description != "" {
+			return "🛠️ " + truncate(oneLine(v.Description), 200)
+		}
+		return "🛠️ Bash"
 
 	case "Read":
 		var v struct {

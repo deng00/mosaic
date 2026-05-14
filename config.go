@@ -101,8 +101,14 @@ type BotConfig struct {
 	// Space, every newly added m.space.child triggers a JoinRoomByID
 	// for that child. Works for `restricted`-rule rooms (the bot is
 	// auto-authorised by Space membership). Private rooms still need
-	// an explicit invite. Default: false — opt in per bot.
-	AutoJoinSpaceChildren bool `yaml:"auto_join_space_children,omitempty"`
+	// an explicit invite.
+	//
+	// Default: true. This is the path that fires the auto-init of new
+	// project Spaces (EnsureProject + default `dev`/`deploy` rooms);
+	// hand-written configs with the field omitted should still get it.
+	// Pointer so we can tell an explicit `false` apart from "unset" —
+	// set `auto_join_space_children: false` in YAML to opt out per bot.
+	AutoJoinSpaceChildren *bool `yaml:"auto_join_space_children,omitempty"`
 
 	// --- Runtime selection + cross-runtime settings ---
 	// Runtime picks which coding-agent CLI to drive ("claude" / "codex").

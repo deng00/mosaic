@@ -124,6 +124,10 @@ func runBot(ctx context.Context, fc *FileConfig, bc BotConfig, mgr *AgentRuntime
 		}
 	}
 
+	autoJoinSpaceChildren := true
+	if bc.AutoJoinSpaceChildren != nil {
+		autoJoinSpaceChildren = *bc.AutoJoinSpaceChildren
+	}
 	mx, err := matrix.Login(ctx, matrix.Config{
 		Homeserver:            fc.Homeserver,
 		UserID:                bc.User,
@@ -131,7 +135,7 @@ func runBot(ctx context.Context, fc *FileConfig, bc BotConfig, mgr *AgentRuntime
 		DeviceName:            deviceName,
 		CryptoDB:              filepath.Join(dataDir, "crypto.db"),
 		PickleKey:             pickle,
-		AutoJoinSpaceChildren: bc.AutoJoinSpaceChildren,
+		AutoJoinSpaceChildren: autoJoinSpaceChildren,
 		MediaDir:              filepath.Join(dataDir, "attachments"),
 	})
 	if err != nil {

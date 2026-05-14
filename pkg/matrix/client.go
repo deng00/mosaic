@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -739,6 +740,21 @@ func (c *Client) SendTextMentions(ctx context.Context, roomID id.RoomID, body st
 	return resp.EventID, nil
 }
 
+// SendEmote posts an m.emote message (IRC-style /me). Element
+// renders this as "* <displayName> <body>" in italics, without a
+// chat bubble — used by Mosaic for low-emphasis tool-activity
+// chatter (e.g. Bash invocations) that shouldn't read as the
+// agent's own dialogue.
+func (c *Client) SendEmote(ctx context.Context, roomID id.RoomID, body string) (id.EventID, error) {
+	content := buildTextContent(body)
+	content.MsgType = event.MsgEmote
+	resp, err := c.mx.SendMessageEvent(ctx, roomID, event.EventMessage, content)
+	if err != nil {
+		return "", err
+	}
+	return resp.EventID, nil
+}
+
 // EditText replaces the body of an earlier message. Per Matrix spec,
 // edits are sent as a new event with m.relates_to.rel_type=m.replace.
 // Element renders this as the original event with "(edited)" tag and
@@ -1157,6 +1173,20 @@ func extFromMime(mime string) string {
 		return ".mp3"
 	}
 	return ""
+}
+
+// IsRateLimited reports whether err is a Synapse M_LIMIT_EXCEEDED
+// response (rc_message / rc_joins / rc_create_room / rc_login throttling).
+// Callers can branch on this to retry with backoff or surface a different
+// hint than for permission failures.
+func IsRateLimited(err error) bool {
+	return errors.Is(err, mautrix.MLimitExceeded)
+}
+
+// IsForbidden reports whether err is a Synapse M_FORBIDDEN response —
+// most often a power-level / membership permission failure.
+func IsForbidden(err error) bool {
+	return errors.Is(err, mautrix.MForbidden)
 }
 
 // normalizeUserID turns "claude-coder" into "claude-coder" for the

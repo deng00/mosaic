@@ -51,9 +51,11 @@ design point).
 whose target is itself a Space (i.e. a project Space created under an
 existing Org Space), the bridge fires `EnsureProject` (insert-if-absent
 keyed by Space ID, default name = the Space's `m.room.name`) and the
-winning agent creates the default topic-rooms (`git`, `deploy`, `bugs`,
-`feature`, `test` — see `defaultProjectRooms` in `pkg/agent/agent.go`)
-as children. Multi-agent races are resolved by `EnsureProject` returning
+winning agent creates the default topic-rooms (`dev`, `deploy` — see
+`defaultProjectRooms` in `pkg/agent/agent.go`) as children. Kept to two
+rooms because the previous five-room set saw partial creation in
+practice (only 1–2 rooms appearing), suspected to be Synapse rate
+limits on room creation; two is below the threshold. Multi-agent races are resolved by `EnsureProject` returning
 `created=true` exactly once. Direct invites to a top-level Space don't
 trigger this — only the auto-join-from-parent path.
 

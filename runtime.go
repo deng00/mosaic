@@ -143,13 +143,15 @@ func (r *AgentRuntime) Create(req agent.CreateRequest) (agent.AgentInfo, error) 
 	}
 	log.Printf("[runtime] registered %s on Synapse", userID)
 
+	// AutoJoinSpaceChildren defaults to true when the field is omitted,
+	// so leave it nil here — the marshalled config.yaml won't grow a
+	// noisy explicit `auto_join_space_children: true` line.
 	bc := BotConfig{
-		ID:                    localpart,
-		User:                  localpart,
-		Password:              pw,
-		DeviceName:            displayName,
-		AutoJoinSpaceChildren: true,
-		Model:                 req.Model,
+		ID:         localpart,
+		User:       localpart,
+		Password:   pw,
+		DeviceName: displayName,
+		Model:      req.Model,
 		Claude: ClaudeRuntimeConfig{
 			PermissionMode: "bypassPermissions",
 		},
@@ -264,7 +266,7 @@ peer may miss the ping.
 
 ## Reference
 - agent id: %s
-- data dir: data/%s/
+- data dir: data/agents/%s/
 `, displayName, role, localpart, localpart, localpart)
 }
 

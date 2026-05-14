@@ -13,6 +13,7 @@
 package agent
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -517,7 +518,16 @@ func (b *Bridge) handleSpaceJoinedWithInvite(ctx context.Context, parentSpace, n
 		invites = []id.UserID{inviteUser}
 	}
 
-	for _, r := range defaultProjectRooms {
+	for i, r := range defaultProjectRooms {
+		// Space + every room is a separate state-write burst. Synapse's
+		// rc_message / rc_joins / rc_create_room limits will start
+		// dropping requests if we fire them back-to-back — historically
+		// we saw only the first 1–2 default rooms appear before the
+		// rest silently failed. 200ms between rooms keeps us under
+		// every commonly-configured limit.
+		if i > 0 {
+			time.Sleep(200 * time.Millisecond)
+		}
 		_, err := b.mx.CreateRoom(ctx, matrix.CreateRoomOpts{
 			Name:             r.name,
 			Topic:            r.topic,
@@ -528,17 +538,35 @@ func (b *Bridge) handleSpaceJoinedWithInvite(ctx context.Context, parentSpace, n
 		})
 		if err != nil {
 			log.Printf("[agent] default room %q in space %s failed: %v", r.name, newSpace, err)
-			// Most common cause: bot lacks PL 50 in the new sub-Space, so
-			// linking m.space.child fails. Surface a hint in the parent
-			// Org Space (where the bot was originally invited and likely
-			// has higher PL — at least the user is watching it) so the
-			// user knows what to do next. Best-effort. Bail on the first
-			// failure since PL issues will affect every subsequent room.
-			hint := fmt.Sprintf(
-				"⚠️ 在新 Space **%s** 里建默认 room `%s` 失败：我在该 Space 没有足够权限"+
-					"（需要 Moderator / PL 50 才能挂 child room）。\n\n"+
-					"在 Element 里把我提为 Moderator，再重新创建一次该 Space 就会自动建好默认 rooms。",
-				defaultName, r.name)
+			// Two failure modes hit this branch with very different fixes,
+			// so route the hint by error code:
+			//   - M_LIMIT_EXCEEDED: Synapse rc_* throttling — transient,
+			//     just retry. Likely when N rooms are being created
+			//     back-to-back; the 200ms between CreateRoom calls above
+			//     usually keeps us under the limit, but bursts elsewhere
+			//     in the same minute can still trip it.
+			//   - everything else (typically M_FORBIDDEN): bot lacks PL 50
+			//     in newSpace, can't write m.space.child. Real fix is to
+			//     promote the bot to Moderator. Only happens on the
+			//     auto-join path (bot joining a Space someone else built);
+			//     /project new creates the Space itself so the bot is
+			//     PL 100 there.
+			// Bail on the first failure either way — both modes affect
+			// every subsequent room in the loop. The hint posts into the
+			// parent Org Space, where the user is watching.
+			var hint string
+			if matrix.IsRateLimited(err) {
+				hint = fmt.Sprintf(
+					"⚠️ 在新 Space **%s** 里建默认 room `%s` 被 Synapse 限流（`M_LIMIT_EXCEEDED`）。\n\n"+
+						"稍等十几秒后重发 `/project new %s`，或在该 Space 里手动 add child room。",
+					defaultName, r.name, defaultName)
+			} else {
+				hint = fmt.Sprintf(
+					"⚠️ 在新 Space **%s** 里建默认 room `%s` 失败：%v\n\n"+
+						"常见原因：我在该 Space 不是 Moderator（需要 PL ≥ 50 才能挂 child room）。"+
+						"在 Element 里把我提为 Moderator，再重新创建一次该 Space 就会自动建好默认 rooms。",
+					defaultName, r.name, err)
+			}
 			if _, sendErr := b.mx.SendText(ctx, parentSpace, hint); sendErr != nil {
 				log.Printf("[agent] default-room failure hint send to %s failed: %v", parentSpace, sendErr)
 			}
@@ -554,11 +582,8 @@ var defaultProjectRooms = []struct {
 	name  string
 	topic string
 }{
-	{"git", "代码提交 / PR / 分支讨论"},
+	{"dev", "开发讨论：代码 / PR / bug / 功能 / 测试"},
 	{"deploy", "部署 / CI/CD / 发布"},
-	{"bugs", "bug 报告与跟踪"},
-	{"feature", "功能开发讨论"},
-	{"test", "测试与 QA"},
 }
 
 // roomSession is the per-room state: a long-lived claude process and
@@ -584,6 +609,13 @@ type turnRequest struct {
 	sender      id.UserID
 	text        string
 	attachments []matrix.Attachment
+	// compact marks this request as the /compact summarization turn:
+	// dispatchLoop sets pendingCompact just before runTurn fires, so the
+	// "save final text to SUMMARY.md + end session" hook in runTurn
+	// triggers on this turn and only this turn. Setting the flag at
+	// enqueue time would let a preceding user-message turn consume it
+	// instead and save the wrong body.
+	compact bool
 }
 
 func (b *Bridge) handleMessage(ctx context.Context, im matrix.IncomingMessage) {
@@ -713,10 +745,8 @@ func (b *Bridge) handleSlash(roomID id.RoomID, sender id.UserID, text string) bo
 		return b.handleAgentSlash(ctx, roomID, sender, rest)
 	case "/project":
 		return b.handleProjectSlash(ctx, roomID, sender, rest)
-	case "/new-session":
-		b.endSession(roomID)
-		_, _ = b.mx.SendText(ctx, roomID, "🌱 已开启新会话（前序对话不再传递）")
-		return true
+	case "/session":
+		return b.handleSessionSlash(ctx, roomID, rest)
 	case "/status":
 		b.sendStatus(ctx, roomID)
 		return true
@@ -755,15 +785,25 @@ func (b *Bridge) handleSlash(roomID id.RoomID, sender id.UserID, text string) bo
 		b.handleExportSlash(ctx, roomID, sender, rest)
 		return true
 	case "/compact":
-		// Mark room as "save next turn body to SUMMARY.md, then end
-		// session". Inject the summarization prompt as if the user
-		// asked for it — the resulting markdown becomes the room's
-		// memory and is also visible in chat.
-		b.mu.Lock()
-		b.pendingCompact[roomID] = true
-		b.mu.Unlock()
-		_, _ = b.mx.SendText(ctx, roomID, "🗜️ 正在生成会话摘要并归档（这一轮完成后会清空 LLM 上下文）...")
-		go b.runTurn(roomID, b.mx.UserID(), compactPrompt, nil)
+		// Inject the summarization prompt as a fresh turn through the
+		// per-room inbox so it serialises with any in-flight turn —
+		// running it as `go b.runTurn(...)` would race-drain the same
+		// proc.Events() channel as the active dispatchLoop and produce
+		// scrambled output. dispatchLoop sets pendingCompact right
+		// before runTurn fires, so the "save SUMMARY.md + endSession"
+		// hook latches onto this specific turn.
+		sess := b.getOrCreate(context.Background(), roomID)
+		if sess == nil || sess.inbox == nil {
+			_, _ = b.mx.SendText(ctx, roomID,
+				"❌ 起 claude 子进程失败，无法 /compact。先 `!project status` 看 cwd 是否有效。")
+			return true
+		}
+		select {
+		case sess.inbox <- turnRequest{sender: b.mx.UserID(), text: compactPrompt, compact: true}:
+			_, _ = b.mx.SendText(ctx, roomID, "🗜️ 已排队生成会话摘要（前面如果还有未完成的回合会先跑完，再做摘要并清空 LLM 上下文）...")
+		default:
+			_, _ = b.mx.SendText(ctx, roomID, inboxFullMsg)
+		}
 		return true
 	}
 	return false
@@ -1261,7 +1301,7 @@ func (b *Bridge) applyProjectMutation(ctx context.Context, roomID id.RoomID, nam
 		parts = append(parts, "model="+model)
 	}
 	_, _ = b.mx.SendText(ctx, roomID, fmt.Sprintf(
-		"✅ 已更新 project (`%s`) %s\n\n下次该 Space 下任意 room **新起的 claude session** 立即生效。当前 session 仍用旧 cwd——发 `/new-session` 强制刷新。",
+		"✅ 已更新 project (`%s`) %s\n\n下次该 Space 下任意 room **新起的 claude session** 立即生效。当前 session 仍用旧 cwd——发 `/session new` 强制刷新。",
 		FoldHomeServer(spaceID, b.opts.ServerName), strings.Join(parts, "  ·  ")))
 	return true
 }
@@ -1300,6 +1340,23 @@ func (b *Bridge) handleProjectNew(ctx context.Context, roomID id.RoomID, sender 
 			name))
 		return true
 	}
+	// Guard: refuse to nest under a Space we've already registered as a
+	// project. That's the classic "bot didn't join the Org Space" trap —
+	// SpaceHierarchy can only see Spaces the bot is in, so BFS stops at
+	// the highest one it can reach. If that's another project Space, the
+	// new sub-Space would dangle under a sibling project rather than the
+	// real Org Space. Refuse loudly and tell the user to invite the bot
+	// into the Org Space.
+	if _, isProject := b.opts.Projects[string(parentSpace)]; isProject {
+		_, _ = b.mx.SendText(ctx, roomID, fmt.Sprintf(
+			"⛔ 我视野里最顶层的 Space `%s` 是另一个 project，不是 Org Space。\n\n"+
+				"大概率是我没加入你的 Org Space —— Matrix 协议下我看不到没加入的 Space 的 child 关系，BFS 就在这里断了。\n\n"+
+				"修法：在 Element 里把我（`%s`）邀请进 Org Space，并 Promote 到 **Moderator**（PL ≥ 50），然后重试 `/project new %s`。",
+			FoldHomeServer(string(parentSpace), b.opts.ServerName),
+			FoldHomeServer(string(b.mx.UserID()), b.opts.ServerName),
+			name))
+		return true
+	}
 
 	newSpace, parentLinkErr, err := b.mx.CreateSpace(ctx, name, parentSpace, sender)
 	if err != nil {
@@ -1327,17 +1384,27 @@ func (b *Bridge) handleProjectNew(ctx context.Context, roomID id.RoomID, sender 
 			"在父 Space 里手动 add child 即可挂回去；或重试 `/project new`。",
 			parentLinkErr)
 	} else {
-		sb.WriteString("\n下面已自动建好默认 rooms：`git` / `deploy` / `bugs` / `feature` / `test`。")
+		sb.WriteString("\n下面已自动建好默认 rooms：`dev` / `deploy`。")
 	}
-	_, _ = b.mx.SendText(ctx, roomID, sb.String())
+	// The room-creation burst above (CreateSpace + N×CreateRoom) easily
+	// trips Synapse rc_message/rc_joins limits — without this breather
+	// the feedback SendText silently 429s and the user sees the new
+	// Space + rooms in their sidebar but no confirmation message.
+	time.Sleep(200 * time.Millisecond)
+	if _, err := b.mx.SendText(ctx, roomID, sb.String()); err != nil {
+		log.Printf("[agent] /project new feedback send to %s failed: %v", roomID, err)
+	}
 	return true
 }
 
 // resolveProjectParent picks the Space to nest a new project Space
 // under, given the room the user ran /project new from. BFS walks the
 // inverted m.space.child graph (built from every Space the bot is
-// joined to) up to the topmost ancestor and prefers the highest one
-// the bot has PL ≥ 50 in.
+// joined to) and returns the *single* topmost ancestor — no fallback
+// to closer ancestors. A prior version preferred any PL ≥ 50 ancestor
+// scanning from the top down; that silently picked a sibling project
+// Space when the bot wasn't in the real Org Space, dangling new
+// projects under a peer instead of the root.
 //
 // Why the inverse graph: most clients (Element specifically) only
 // publish m.space.child in parents, not m.space.parent in children.
@@ -1345,14 +1412,14 @@ func (b *Bridge) handleProjectNew(ctx context.Context, roomID id.RoomID, sender 
 // nesting and never reaches the Org Space at the root.
 //
 // Return contract:
-//   - parent != "" → a Space the bot has PL ≥ 50 in; safe to nest under.
-//   - parent == "", topmost == "" → no ancestor Spaces at all (room not
-//     in any Space). Caller should tell the user to run from inside a
-//     Space.
-//   - parent == "", topmost != "" → ancestors exist but the bot is not
-//     Moderator/Admin in any of them. topmost is the highest ancestor,
-//     surfaced so the caller can name the Space the user needs to
-//     promote the bot in. No silent fallback — promotion is mandatory.
+//   - parent != "" → topmost ancestor the bot has PL ≥ 50 in; caller
+//     should still verify it isn't one of our own registered project
+//     Spaces (that's the "bot didn't join the Org Space" trap, handled
+//     in handleProjectNew).
+//   - parent == "", topmost == "" → no ancestor Spaces at all (room
+//     not in any Space).
+//   - parent == "", topmost != "" → topmost exists but bot lacks
+//     PL ≥ 50 there. Caller names topmost in the promotion prompt.
 func (b *Bridge) resolveProjectParent(ctx context.Context, roomID id.RoomID) (parent, topmost id.RoomID, err error) {
 	if isSpace, _ := b.mx.IsSpace(ctx, roomID); isSpace {
 		if pl, e := b.mx.MyPowerLevel(ctx, roomID); e == nil && pl >= 50 {
@@ -1384,14 +1451,11 @@ func (b *Bridge) resolveProjectParent(ctx context.Context, roomID id.RoomID) (pa
 	if len(ancestors) == 0 {
 		return "", "", nil
 	}
-	// ancestors is BFS-ordered (closer first); iterate from the back
-	// to prefer the topmost Org Space when bot has PL there.
-	for i := len(ancestors) - 1; i >= 0; i-- {
-		if pl, e := b.mx.MyPowerLevel(ctx, ancestors[i]); e == nil && pl >= 50 {
-			return ancestors[i], ancestors[i], nil
-		}
+	topmost = ancestors[len(ancestors)-1]
+	if pl, e := b.mx.MyPowerLevel(ctx, topmost); e == nil && pl >= 50 {
+		parent = topmost
 	}
-	return "", ancestors[len(ancestors)-1], nil
+	return parent, topmost, nil
 }
 
 const projectSlashHelp = `**` + "`/project`" + ` 命令家族**
@@ -1477,9 +1541,159 @@ You are Cindy, the onboarding lead.
 
 每次 fresh claude session 启动时，` + "`MEMORY.md`" + ` 会作为 system prompt 注入。`
 
+const sessionSlashHelp = `**` + "`/session`" + ` 命令家族**
+
+- ` + "`/session new`" + ` — 直接抛弃当前会话（不留摘要），下一条消息起全新 claude session
+- ` + "`/session set <uuid>`" + ` — 把本 room 绑定到一个已存在的 claude session id（例如从终端 ` + "`claude --resume`" + ` 出来的那条对话），下一条消息会 ` + "`--resume`" + ` 接上。会扫 ` + "`~/.claude/projects/*/<uuid>.jsonl`" + ` 校验 session 记录的 cwd 与 room 配置的 cwd 是否一致，不一致直接拒绝（claude 的 session 文件是按 cwd 切目录存的，不一致 ` + "`--resume`" + ` 会找不到）
+- ` + "`/session show`" + ` — 显示本 room 当前绑定的 session id + cwd + 终端 ` + "`claude --resume`" + ` 复制命令
+- ` + "`/session help`" + ` — 这条帮助`
+
+// claudeSessionIDRE matches the UUID format claude code emits for
+// session_id (8-4-4-4-12 lowercase hex). We're strict here because
+// /session set turns into a `claude --resume <id>` invocation, and a
+// malformed id would silently boot a fresh session instead.
+var claudeSessionIDRE = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// handleSessionSlash dispatches /session sub-commands. Unknown subs
+// echo a hint; bare /session shows help.
+func (b *Bridge) handleSessionSlash(ctx context.Context, roomID id.RoomID, rest string) bool {
+	sub := strings.TrimSpace(rest)
+	arg := ""
+	if i := strings.IndexAny(sub, " \t"); i > 0 {
+		arg = strings.TrimSpace(sub[i+1:])
+		sub = sub[:i]
+	}
+	switch sub {
+	case "", "help":
+		_, _ = b.mx.SendText(ctx, roomID, sessionSlashHelp)
+		return true
+	case "new":
+		b.endSession(roomID)
+		_, _ = b.mx.SendText(ctx, roomID, "🌱 已开启新会话（前序对话不再传递）")
+		return true
+	case "set":
+		b.handleSessionSet(ctx, roomID, arg)
+		return true
+	case "show":
+		b.handleSessionShow(ctx, roomID)
+		return true
+	}
+	_, _ = b.mx.SendText(ctx, roomID, "未知 `/session` 子命令；见 `/session help`")
+	return true
+}
+
+// handleSessionShow prints the room's currently bound claude session
+// id (if any) and the cwd it lives under, plus a copy-pasteable
+// terminal `claude --resume` command. Subset of /status focused
+// purely on the session — handy for grabbing the id to migrate the
+// other direction (room → terminal).
+func (b *Bridge) handleSessionShow(ctx context.Context, roomID id.RoomID) {
+	sid := ""
+	if b.opts.Sessions != nil {
+		sid = b.opts.Sessions.Get(string(roomID))
+	}
+	if sid == "" {
+		_, _ = b.mx.SendText(ctx, roomID, "_(本 room 还没有 resumable session — 发一条消息会自动起一个 fresh session)_")
+		return
+	}
+	r := b.resolve(ctx, roomID)
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "- session id: `%s`\n", sid)
+	if r.Cwd != "" {
+		fmt.Fprintf(&sb, "- cwd: `%s`\n", r.Cwd)
+		fmt.Fprintf(&sb, "- 终端恢复：`cd %s && claude --resume %s`\n", r.Cwd, sid)
+		sb.WriteString("  （先发 `/archive` 或 `/session new` 释放 mosaic 这边的 claude 进程，避免两个进程并发写同一会话文件）")
+	}
+	_, _ = b.mx.SendText(ctx, roomID, sb.String())
+}
+
+// handleSessionSet binds an existing claude session id (e.g. one
+// running in a terminal `claude --resume`) to this room. The cwd
+// recorded inside the session jsonl must match the room's resolved
+// cwd, otherwise `claude --resume` would silently start a fresh
+// session — refusing up-front is clearer than silent failure.
+func (b *Bridge) handleSessionSet(ctx context.Context, roomID id.RoomID, sid string) {
+	sid = strings.TrimSpace(sid)
+	if sid == "" {
+		_, _ = b.mx.SendText(ctx, roomID, "用法：`/session set <session-uuid>`")
+		return
+	}
+	if !claudeSessionIDRE.MatchString(sid) {
+		_, _ = b.mx.SendText(ctx, roomID, "❌ 不像合法的 claude session id（应为 UUID 格式 8-4-4-4-12）")
+		return
+	}
+	if b.opts.Sessions == nil {
+		_, _ = b.mx.SendText(ctx, roomID, "❌ SessionStore 未初始化，不能持久化 session id")
+		return
+	}
+	jsonlPath, sessionCwd, err := extractClaudeSessionCwd(sid)
+	if err != nil {
+		_, _ = b.mx.SendText(ctx, roomID, fmt.Sprintf("❌ 找不到本机 claude session：%s\n\n确认 session id 写对了，并且这台机器上 `~/.claude/projects/*/%s.jsonl` 存在。", err.Error(), sid))
+		return
+	}
+	r := b.resolve(ctx, roomID)
+	if r.Cwd == "" {
+		_, _ = b.mx.SendText(ctx, roomID, fmt.Sprintf("❌ 本 room 还没配 cwd，无法绑定。\n\nclaude session 记录的 cwd 是 `%s`，先 `/project cwd %s` 给本 room 所属 Space 配上 cwd，再 `/session set %s`。", sessionCwd, sessionCwd, sid))
+		return
+	}
+	roomCwd := filepath.Clean(expandHome(r.Cwd))
+	sessionCwdNorm := filepath.Clean(sessionCwd)
+	if roomCwd != sessionCwdNorm {
+		_, _ = b.mx.SendText(ctx, roomID, fmt.Sprintf("❌ cwd 不一致，拒绝绑定。\n\n- room cwd: `%s`\n- session cwd（来自 `%s`）: `%s`\n\nclaude `--resume` 按 cwd 切目录存 session 文件，不一致会找不到。先 `/project cwd %s` 改 room/project cwd，再 `/session set %s`。", roomCwd, jsonlPath, sessionCwdNorm, sessionCwdNorm, sid))
+		return
+	}
+	b.endSession(roomID)
+	if err := b.opts.Sessions.Set(string(roomID), sid); err != nil {
+		_, _ = b.mx.SendText(ctx, roomID, "❌ 写 sessions.json 失败："+err.Error())
+		return
+	}
+	_, _ = b.mx.SendText(ctx, roomID, fmt.Sprintf("🔗 已绑定终端 claude session `%s`（cwd=`%s`）。下一条消息会 `--resume` 接续上下文。", sid, sessionCwdNorm))
+}
+
+// extractClaudeSessionCwd locates ~/.claude/projects/*/<sid>.jsonl
+// and returns the cwd recorded in the first event that carries one.
+// claude-code's project subdir name is a slugified cwd (slashes →
+// dashes), but slugify is lossy, so we don't invert it — we glob
+// across all project subdirs and trust the authoritative `cwd` field
+// inside the jsonl.
+func extractClaudeSessionCwd(sid string) (jsonlPath, cwd string, err error) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "", "", fmt.Errorf("resolve home dir: %w", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(home, ".claude", "projects", "*", sid+".jsonl"))
+	if err != nil {
+		return "", "", err
+	}
+	if len(matches) == 0 {
+		return "", "", fmt.Errorf("no session file matching ~/.claude/projects/*/%s.jsonl", sid)
+	}
+	jsonlPath = matches[0]
+	f, err := os.Open(jsonlPath)
+	if err != nil {
+		return jsonlPath, "", err
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	// Assistant turns can produce multi-MB lines; lift the default 64KB cap.
+	scanner.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
+	for i := 0; i < 200 && scanner.Scan(); i++ {
+		var ev struct {
+			Cwd string `json:"cwd"`
+		}
+		if json.Unmarshal(scanner.Bytes(), &ev) == nil && ev.Cwd != "" {
+			return jsonlPath, ev.Cwd, nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return jsonlPath, "", err
+	}
+	return jsonlPath, "", fmt.Errorf("no cwd field in first 200 events of %s", jsonlPath)
+}
+
 const slashHelp = `**可用命令**
 
-- ` + "`/new-session`" + ` — 直接抛弃当前会话（不留摘要），下一条消息起全新 claude session
+- ` + "`/session`" + ` — session 管理（new / set …）— 见 ` + "`/session help`" + `
 - ` + "`/compact`" + ` — 让 claude 把当前会话总结成一份 markdown 摘要，归档到本 room 的 ` + "`SUMMARY.md`" + `；之后的新会话会自动注入这份摘要作为系统提示
 - ` + "`/archive`" + ` — 把本 room 标记为已归档：bot 不再响应（除 ` + "`/unarchive`" + `），但 memory 文件保留
 - ` + "`/unarchive`" + ` — 唤醒已归档的 room
@@ -1523,6 +1737,10 @@ func (b *Bridge) sendStatus(ctx context.Context, roomID id.RoomID) {
 	fmt.Fprintf(&sb, "- claude process: %s\n", procStatus)
 	if resume != "" {
 		fmt.Fprintf(&sb, "- resumable session id: `%s`\n", resume)
+		if r.Cwd != "" {
+			fmt.Fprintf(&sb, "- 终端恢复：`cd %s && claude --resume %s`\n", r.Cwd, resume)
+			sb.WriteString("  （先发 `/archive` 或 `/session new` 释放 mosaic 这边的 claude 进程，避免两个进程并发写同一会话文件）\n")
+		}
 	} else {
 		sb.WriteString("- resumable session id: _(none yet)_\n")
 	}
@@ -1883,7 +2101,14 @@ func (t *turn) consume(ctx context.Context, ev runtime.Event) bool {
 		}
 		body := FormatToolUse(e.Name, e.Input)
 		t.refreshTypingIfStale(ctx)
-		if _, err := t.b.mx.SendText(ctx, t.roomID, body); err != nil {
+		// Bash is renderered as m.emote so it reads as "* <agent>
+		// running deploy" — de-emphasized housekeeping vs the agent's
+		// own dialogue (m.text). Other tools stay on m.text for now.
+		send := t.b.mx.SendText
+		if e.Name == "Bash" {
+			send = t.b.mx.SendEmote
+		}
+		if _, err := send(ctx, t.roomID, body); err != nil {
 			log.Printf("[agent] send tool_use msg failed: %v", err)
 		}
 		return false
@@ -2054,15 +2279,20 @@ func (b *Bridge) getOrCreate(ctx context.Context, roomID id.RoomID) *roomSession
 
 // dispatchLoop drains a room's inbox FIFO and runs one turn end-to-end
 // per message. Exits when proc.Events() closes (claude died) or
-// when the session is removed (e.g. /new-session, /compact).
+// when the session is removed (e.g. /session new, /compact).
 func (b *Bridge) dispatchLoop(s *roomSession) {
 	for req := range s.inbox {
+		if req.compact {
+			b.mu.Lock()
+			b.pendingCompact[s.roomID] = true
+			b.mu.Unlock()
+		}
 		b.runTurn(s.roomID, req.sender, req.text, req.attachments)
-		// Note: if /new-session or /compact ran during the turn, the
+		// Note: if /session new or /compact ran during the turn, the
 		// session was removed from b.sessions but THIS goroutine
 		// keeps draining its old inbox (now orphaned). The next
 		// handleMessage will resolve a fresh session via getOrCreate.
-		// To stop this old loop, /new-session / /compact close the
+		// To stop this old loop, /session new / /compact close the
 		// inbox via endSession.
 		b.mu.Lock()
 		_, stillCurrent := b.sessions[s.roomID]
