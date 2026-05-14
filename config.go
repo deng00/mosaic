@@ -130,12 +130,16 @@ type BotConfig struct {
 	// runtime subprocess. Useful for CLAUDE_CODE_OAUTH_TOKEN etc.
 	Env map[string]string `yaml:"env,omitempty"`
 
-	// IgnoreToolsMsg lists tool names whose ToolUse invocation
-	// messages are silently dropped (not relayed into the room).
-	// Matched case-insensitively against the runtime tool name
-	// (Bash / Read / Grep / …). nil/unset = apply the daemon default
-	// (Grep, Read, Write, ToolSearch). An explicit empty list in
-	// YAML (`ignore_tools_msg: []`) disables filtering entirely.
+	// Tools groups per-agent tool-rendering / tool-availability knobs.
+	// See ToolsConfig for the fields and defaults.
+	Tools ToolsConfig `yaml:"tools,omitempty"`
+
+	// IgnoreToolsMsg is the legacy name for Tools.IgnoreTools. Kept
+	// for backward compatibility with pre-tools-block configs. When
+	// Tools.IgnoreTools is nil and this is set, this value is used
+	// and a deprecation note is logged.
+	//
+	// Deprecated: use Tools.IgnoreTools.
 	IgnoreToolsMsg *[]string `yaml:"ignore_tools_msg,omitempty"`
 
 	// --- Runtime-specific sub-blocks ---
@@ -143,6 +147,37 @@ type BotConfig struct {
 	// silently ignored (kept around so a user can switch Runtime
 	// without losing per-driver settings).
 	Claude ClaudeRuntimeConfig `yaml:"claude,omitempty"`
+}
+
+// ToolsConfig is the per-agent `tools:` block in config.yaml. It
+// controls which tool calls reach the chat timeline and how they're
+// rendered there. Tool availability (whether the underlying claude
+// subprocess can use a tool at all) is also configured here for the
+// small set of tools mosaic re-implements itself (currently just
+// TodoWrite).
+type ToolsConfig struct {
+	// IgnoreTools lists tool names whose ToolUse invocation messages
+	// are silently dropped (not relayed into the room). Matched
+	// case-insensitively against the runtime tool name (Bash / Read /
+	// Grep / …). nil/unset = apply the daemon default (Grep, Read,
+	// Write, ToolSearch). An explicit empty list in YAML
+	// (`ignore_tools: []`) disables filtering entirely.
+	IgnoreTools *[]string `yaml:"ignore_tools,omitempty"`
+
+	// EditShowCode controls Edit-tool rendering. When true (default),
+	// the diff payload is rendered inline as a fenced code block in
+	// an m.text bubble. When false, Edit is collapsed to a one-line
+	// "✏️ <path>" emote — same low-emphasis treatment as Bash/Read.
+	// Pointer so we can tell "unset" (apply default true) apart from
+	// "explicit false". `edit_show_code: false` in YAML opts out.
+	EditShowCode *bool `yaml:"edit_show_code,omitempty"`
+
+	// TodoWriteDisable, when true, passes `--disallowed-tools TodoWrite`
+	// to the spawned claude subprocess so the model can't call it.
+	// TodoWrite is a claude-side built-in that mosaic re-renders into
+	// the room; users who don't want the per-turn checklists noise
+	// can switch it off entirely. Default false.
+	TodoWriteDisable bool `yaml:"todowrite_disable,omitempty"`
 }
 
 // ClaudeRuntimeConfig holds settings that only the claude runtime

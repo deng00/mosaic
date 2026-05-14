@@ -23,12 +23,12 @@ import (
 func FormatToolUse(name string, input json.RawMessage) string {
 	switch name {
 	case "Bash":
-		// Body sent as m.emote (see Bridge.consume), so Element renders
-		// "* <agent> 🛠️ <description>". We surface only the description
-		// here — the actual command is internal housekeeping and the
-		// user doesn't need to read it. Falls back to "Bash" when the
-		// description field is empty (rare; Claude Code normally fills
-		// it in).
+		// Tool_use blocks default to m.emote (see Bridge.consume), so
+		// Element shows "* <agent> 🛠️ <description>". We surface only
+		// the description here — the actual command is internal
+		// housekeeping and the user doesn't need to read it. Falls
+		// back to "Bash" when the description field is empty (rare;
+		// Claude Code normally fills it in).
 		var v struct {
 			Description string `json:"description"`
 		}
@@ -171,11 +171,83 @@ func FormatToolUse(name string, input json.RawMessage) string {
 		_ = json.Unmarshal(input, &v)
 		return "🧩 **Skill**  \n`" + v.Skill + "`"
 
+	case "ToolSearch":
+		// Claude Code's deferred-tools mechanism: model calls this to
+		// pull a tool's schema into context before invoking it. Query
+		// is either `select:Foo,Bar` (exact names) or keywords.
+		var v struct {
+			Query string `json:"query"`
+		}
+		_ = json.Unmarshal(input, &v)
+		return "📚 **ToolSearch**  \n`" + truncate(v.Query, 120) + "`"
+
+	case "EnterPlanMode":
+		// No input parameters — agent is asking to switch into plan
+		// mode before a non-trivial implementation task.
+		return "📐 **EnterPlanMode**"
+
+	case "ExitPlanMode":
+		// Agent finished its plan and is requesting user approval.
+		// AllowedPrompts (optional) lists the categories of actions
+		// it'll need permission for.
+		var v struct {
+			AllowedPrompts []struct {
+				Tool   string `json:"tool"`
+				Prompt string `json:"prompt"`
+			} `json:"allowedPrompts"`
+		}
+		_ = json.Unmarshal(input, &v)
+		if len(v.AllowedPrompts) == 0 {
+			return "📐 **ExitPlanMode**"
+		}
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "📐 **ExitPlanMode** (%d permission(s))", len(v.AllowedPrompts))
+		for _, p := range v.AllowedPrompts {
+			fmt.Fprintf(&sb, "\n- `%s` — %s", p.Tool, truncate(oneLine(p.Prompt), 120))
+		}
+		return sb.String()
+
+	case "Monitor":
+		// Background log/event watcher. The description shows up in
+		// every emitted notification, so it's the most useful field
+		// to surface; command is housekeeping.
+		var v struct {
+			Description string `json:"description"`
+			Command     string `json:"command"`
+			Persistent  bool   `json:"persistent"`
+		}
+		_ = json.Unmarshal(input, &v)
+		tail := ""
+		if v.Persistent {
+			tail = " (persistent)"
+		}
+		label := v.Description
+		if label == "" {
+			label = v.Command
+		}
+		return fmt.Sprintf("👁️ **Monitor**%s  \n%s", tail, truncate(oneLine(label), 200))
+
 	default:
 		// Unknown tool: show name and a tiny preview of input.
 		preview := truncate(oneLine(string(input)), 100)
 		return fmt.Sprintf("🔧 **%s**  \n`%s`", name, preview)
 	}
+}
+
+// FormatEditBrief renders an Edit tool_use as a single emote-friendly
+// line, without the diff payload. Used when ToolsConfig.EditShowCode
+// is false — the user has opted out of seeing diffs inline.
+func FormatEditBrief(input json.RawMessage) string {
+	var v struct {
+		FilePath   string `json:"file_path"`
+		ReplaceAll bool   `json:"replace_all"`
+	}
+	_ = json.Unmarshal(input, &v)
+	marker := ""
+	if v.ReplaceAll {
+		marker = " (replace_all)"
+	}
+	return "✏️ Edit `" + relPath(v.FilePath) + "`" + marker
 }
 
 // relPath shortens absolute paths under $HOME to ~/foo style and

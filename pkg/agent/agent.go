@@ -116,6 +116,16 @@ type Options struct {
 	// before building Options.
 	IgnoreToolsMsg map[string]bool
 
+	// EditShowCode controls whether the Edit tool renders its full
+	// diff payload (true, the default) or collapses to a one-line
+	// "✏️ <path>" emote (false). Mirrors ToolsConfig.EditShowCode.
+	EditShowCode bool
+
+	// DisallowedTools is forwarded to the runtime as
+	// --disallowed-tools entries. Mosaic populates this from per-tool
+	// config flags (e.g. ToolsConfig.TodoWriteDisable adds "TodoWrite").
+	DisallowedTools []string
+
 	// ServerName is our own Matrix server (e.g. "localhost"). Used
 	// to fold the `:server` suffix off displayed room/user IDs that
 	// belong to us — purely a UI sweetener.
@@ -2099,15 +2109,28 @@ func (t *turn) consume(ctx context.Context, ev runtime.Event) bool {
 		if t.b.opts.IgnoreToolsMsg[strings.ToLower(e.Name)] {
 			return false
 		}
-		body := FormatToolUse(e.Name, e.Input)
-		t.refreshTypingIfStale(ctx)
-		// Bash is renderered as m.emote so it reads as "* <agent>
-		// running deploy" — de-emphasized housekeeping vs the agent's
-		// own dialogue (m.text). Other tools stay on m.text for now.
-		send := t.b.mx.SendText
-		if e.Name == "Bash" {
-			send = t.b.mx.SendEmote
+		// Tool_use blocks default to m.emote ("* <agent> …") so they
+		// read as low-emphasis housekeeping rather than the agent's own
+		// dialogue. Exceptions: Edit (diff payload renders much better
+		// inside an m.text bubble than an italicized emote) and
+		// TodoWrite (multi-line bullet list — same reason). Edit can
+		// be downgraded to the emote path via opts.EditShowCode=false,
+		// in which case we also swap to the brief one-line renderer.
+		var body string
+		send := t.b.mx.SendEmote
+		switch {
+		case e.Name == "Edit" && t.b.opts.EditShowCode:
+			body = FormatToolUse(e.Name, e.Input)
+			send = t.b.mx.SendText
+		case e.Name == "Edit":
+			body = FormatEditBrief(e.Input)
+		case e.Name == "TodoWrite":
+			body = FormatToolUse(e.Name, e.Input)
+			send = t.b.mx.SendText
+		default:
+			body = FormatToolUse(e.Name, e.Input)
 		}
+		t.refreshTypingIfStale(ctx)
 		if _, err := send(ctx, t.roomID, body); err != nil {
 			log.Printf("[agent] send tool_use msg failed: %v", err)
 		}
@@ -2227,6 +2250,7 @@ func (b *Bridge) getOrCreate(ctx context.Context, roomID id.RoomID) *roomSession
 		Resume:             resume,
 		ExtraEnv:           envMapToSlice(b.opts.Env),
 		AppendSystemPrompt: appendSP,
+		DisallowedTools:    b.opts.DisallowedTools,
 	})
 	if err != nil {
 		cancel()

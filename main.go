@@ -200,7 +200,9 @@ func runBot(ctx context.Context, fc *FileConfig, bc BotConfig, mgr *AgentRuntime
 		ServerName:     fc.ServerName,
 		DataDir:        fc.DataDir,
 		Env:            bc.Env,
-		IgnoreToolsMsg: resolveIgnoreToolsMsg(bc.IgnoreToolsMsg),
+		IgnoreToolsMsg:  resolveIgnoreToolsMsg(&bc),
+		EditShowCode:    resolveEditShowCode(bc.Tools.EditShowCode),
+		DisallowedTools: resolveDisallowedTools(bc.Tools),
 	})
 	if mgr != nil {
 		mgr.trackBridge(br)
@@ -350,13 +352,23 @@ func must(k string) string {
 // internal-housekeeping tools that don't help the user follow along.
 var defaultIgnoreToolsMsg = []string{"Grep", "Read", "Write", "ToolSearch"}
 
-// resolveIgnoreToolsMsg turns the YAML field (nil = use defaults,
-// explicit list = use as-is, including empty for "no filter") into the
-// lower-cased lookup set the bridge consumes.
-func resolveIgnoreToolsMsg(cfg *[]string) map[string]bool {
-	src := defaultIgnoreToolsMsg
-	if cfg != nil {
-		src = *cfg
+// resolveIgnoreToolsMsg picks the source list in this order:
+//  1. bc.Tools.IgnoreTools (new path)
+//  2. bc.IgnoreToolsMsg    (legacy path, logs a deprecation note)
+//  3. defaultIgnoreToolsMsg
+//
+// An explicit empty list at either layer means "filter nothing" and is
+// honored. Returns the lower-cased lookup set the bridge consumes.
+func resolveIgnoreToolsMsg(bc *BotConfig) map[string]bool {
+	var src []string
+	switch {
+	case bc.Tools.IgnoreTools != nil:
+		src = *bc.Tools.IgnoreTools
+	case bc.IgnoreToolsMsg != nil:
+		src = *bc.IgnoreToolsMsg
+		log.Printf("[%s] config: 'ignore_tools_msg' is deprecated, use 'tools.ignore_tools' instead", bc.ID)
+	default:
+		src = defaultIgnoreToolsMsg
 	}
 	out := make(map[string]bool, len(src))
 	for _, name := range src {
@@ -365,6 +377,25 @@ func resolveIgnoreToolsMsg(cfg *[]string) map[string]bool {
 			continue
 		}
 		out[strings.ToLower(name)] = true
+	}
+	return out
+}
+
+// resolveEditShowCode defaults to true when unset — the diff payload
+// is the most useful thing the Edit tool can show.
+func resolveEditShowCode(cfg *bool) bool {
+	if cfg == nil {
+		return true
+	}
+	return *cfg
+}
+
+// resolveDisallowedTools turns the per-tool disable flags into the
+// --disallowed-tools list claude understands.
+func resolveDisallowedTools(t ToolsConfig) []string {
+	var out []string
+	if t.TodoWriteDisable {
+		out = append(out, "TodoWrite")
 	}
 	return out
 }
