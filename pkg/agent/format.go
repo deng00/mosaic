@@ -49,7 +49,7 @@ func FormatToolUse(name string, input json.RawMessage) string {
 		if v.Limit > 0 {
 			extra = fmt.Sprintf(" (lines %d–%d)", v.Offset+1, v.Offset+v.Limit)
 		}
-		return "📖 **Read**  \n`" + relPath(v.FilePath) + "`" + extra
+		return "📖 Read `" + relPath(v.FilePath) + "`" + extra
 
 	case "Write":
 		var v struct {
@@ -57,9 +57,14 @@ func FormatToolUse(name string, input json.RawMessage) string {
 			Content  string `json:"content"`
 		}
 		_ = json.Unmarshal(input, &v)
-		return fmt.Sprintf("📝 **Write**  \n`%s` (%d B)", relPath(v.FilePath), len(v.Content))
+		return fmt.Sprintf("📝 Write `%s` (%d B)", relPath(v.FilePath), len(v.Content))
 
 	case "Edit":
+		// First line stays single-line ("✏️ Edit `path` [(replace_all)]")
+		// so the emote rendering is compact. When this case is reached
+		// the caller has opted into the full diff payload (edit_show_code
+		// = true → m.text bubble), so we still append the fenced diff
+		// below the header — it's the whole point of the full render.
 		var v struct {
 			FilePath  string `json:"file_path"`
 			OldString string `json:"old_string"`
@@ -71,7 +76,7 @@ func FormatToolUse(name string, input json.RawMessage) string {
 		if v.ReplaceAll {
 			marker = " (replace_all)"
 		}
-		return fmt.Sprintf("✏️ **Edit**  \n`%s`%s\n```diff\n%s%s```",
+		return fmt.Sprintf("✏️ Edit `%s`%s\n```diff\n%s%s```",
 			relPath(v.FilePath), marker,
 			diffLines("-", v.OldString, 20, 200),
 			diffLines("+", v.NewString, 20, 200))
@@ -91,7 +96,7 @@ func FormatToolUse(name string, input json.RawMessage) string {
 		if v.Glob != "" {
 			where += " glob=`" + v.Glob + "`"
 		}
-		return fmt.Sprintf("🔎 **Grep**  \n`%s`%s", truncate(v.Pattern, 80), where)
+		return fmt.Sprintf("🔎 Grep `%s`%s", truncate(v.Pattern, 80), where)
 
 	case "Glob":
 		var v struct {
@@ -103,7 +108,7 @@ func FormatToolUse(name string, input json.RawMessage) string {
 		if v.Path != "" {
 			where = " in `" + relPath(v.Path) + "`"
 		}
-		return "🔭 **Glob**  \n`" + v.Pattern + "`" + where
+		return "🔭 Glob `" + v.Pattern + "`" + where
 
 	case "Agent":
 		var v struct {
@@ -111,7 +116,7 @@ func FormatToolUse(name string, input json.RawMessage) string {
 			SubagentType string `json:"subagent_type"`
 		}
 		_ = json.Unmarshal(input, &v)
-		return fmt.Sprintf("🤖 **Agent**  \n_%s_ — %s",
+		return fmt.Sprintf("🤖 Agent (%s) %s",
 			defaultStr(v.SubagentType, "general"),
 			truncate(v.Description, 120))
 
@@ -155,21 +160,21 @@ func FormatToolUse(name string, input json.RawMessage) string {
 			URL string `json:"url"`
 		}
 		_ = json.Unmarshal(input, &v)
-		return "🌐 **WebFetch**  \n" + v.URL
+		return "🌐 WebFetch " + v.URL
 
 	case "WebSearch":
 		var v struct {
 			Query string `json:"query"`
 		}
 		_ = json.Unmarshal(input, &v)
-		return "🔍 **WebSearch**  \n`" + truncate(v.Query, 120) + "`"
+		return "🔍 WebSearch `" + truncate(v.Query, 120) + "`"
 
 	case "Skill":
 		var v struct {
 			Skill string `json:"skill"`
 		}
 		_ = json.Unmarshal(input, &v)
-		return "🧩 **Skill**  \n`" + v.Skill + "`"
+		return "🧩 Skill `" + v.Skill + "`"
 
 	case "ToolSearch":
 		// Claude Code's deferred-tools mechanism: model calls this to
@@ -179,17 +184,17 @@ func FormatToolUse(name string, input json.RawMessage) string {
 			Query string `json:"query"`
 		}
 		_ = json.Unmarshal(input, &v)
-		return "📚 **ToolSearch**  \n`" + truncate(v.Query, 120) + "`"
+		return "📚 ToolSearch `" + truncate(v.Query, 120) + "`"
 
 	case "EnterPlanMode":
 		// No input parameters — agent is asking to switch into plan
 		// mode before a non-trivial implementation task.
-		return "📐 **EnterPlanMode**"
+		return "📐 EnterPlanMode"
 
 	case "ExitPlanMode":
 		// Agent finished its plan and is requesting user approval.
 		// AllowedPrompts (optional) lists the categories of actions
-		// it'll need permission for.
+		// it'll need permission for; flattened into one line with ';'.
 		var v struct {
 			AllowedPrompts []struct {
 				Tool   string `json:"tool"`
@@ -198,14 +203,39 @@ func FormatToolUse(name string, input json.RawMessage) string {
 		}
 		_ = json.Unmarshal(input, &v)
 		if len(v.AllowedPrompts) == 0 {
-			return "📐 **ExitPlanMode**"
+			return "📐 ExitPlanMode"
 		}
-		var sb strings.Builder
-		fmt.Fprintf(&sb, "📐 **ExitPlanMode** (%d permission(s))", len(v.AllowedPrompts))
+		parts := make([]string, 0, len(v.AllowedPrompts))
 		for _, p := range v.AllowedPrompts {
-			fmt.Fprintf(&sb, "\n- `%s` — %s", p.Tool, truncate(oneLine(p.Prompt), 120))
+			parts = append(parts, fmt.Sprintf("%s(%s)", p.Tool, oneLine(p.Prompt)))
 		}
-		return sb.String()
+		return "📐 ExitPlanMode " + truncate(strings.Join(parts, "; "), 200)
+
+	case "TaskStop":
+		// Cancels a running background task (Monitor / Bash
+		// run_in_background). Surface the task_id so the user can
+		// correlate with whatever started it. No inline-code wrap —
+		// Element's emote rendering breaks <code> onto its own line.
+		var v struct {
+			TaskID string `json:"task_id"`
+		}
+		_ = json.Unmarshal(input, &v)
+		return "🛑 TaskStop " + v.TaskID
+
+	case "TaskOutput":
+		// Pulls stdout/stderr from a background task. `block` defaults
+		// to true (wait for completion) — only call that out when the
+		// model is doing a non-blocking peek.
+		var v struct {
+			TaskID string `json:"task_id"`
+			Block  *bool  `json:"block"`
+		}
+		_ = json.Unmarshal(input, &v)
+		mode := ""
+		if v.Block != nil && !*v.Block {
+			mode = " (non-blocking)"
+		}
+		return "📤 TaskOutput " + v.TaskID + mode
 
 	case "Monitor":
 		// Background log/event watcher. The description shows up in
@@ -225,12 +255,12 @@ func FormatToolUse(name string, input json.RawMessage) string {
 		if label == "" {
 			label = v.Command
 		}
-		return fmt.Sprintf("👁️ **Monitor**%s  \n%s", tail, truncate(oneLine(label), 200))
+		return "👁️ Monitor" + tail + " " + truncate(oneLine(label), 200)
 
 	default:
 		// Unknown tool: show name and a tiny preview of input.
 		preview := truncate(oneLine(string(input)), 100)
-		return fmt.Sprintf("🔧 **%s**  \n`%s`", name, preview)
+		return fmt.Sprintf("🔧 %s `%s`", name, preview)
 	}
 }
 

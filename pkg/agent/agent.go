@@ -233,6 +233,24 @@ func expandHome(p string) string {
 	return p
 }
 
+// looksLikePath returns true when s is shaped like a filesystem path
+// rather than a bare identifier. Trigger on leading "/" / "~" / "./" /
+// "../" — these cover absolute, home-relative, and cwd-relative
+// writings without mis-flagging names that happen to contain a dot
+// (e.g. "v1.2.3", "my.project").
+func looksLikePath(s string) bool {
+	if s == "" {
+		return false
+	}
+	if s[0] == '/' || s[0] == '~' {
+		return true
+	}
+	if strings.HasPrefix(s, "./") || strings.HasPrefix(s, "../") {
+		return true
+	}
+	return false
+}
+
 // resolve answers "which cwd / model should I use for this room?".
 // Layered: per-room override → parent space's project → bot fallback.
 // Result is cached per-room (parents rarely change at runtime).
@@ -523,9 +541,25 @@ func (b *Bridge) handleSpaceJoinedWithInvite(ctx context.Context, parentSpace, n
 	log.Printf("[agent] auto-initialised project for sub-space %s (name=%q, parent=%s)",
 		newSpace, defaultName, parentSpace)
 
-	var invites []id.UserID
+	// Owners gathered into a set: configured admins + the /project new
+	// caller (when present). Each gets invited to every default room
+	// and granted PL 100 so they can rename the room, change topic,
+	// change avatar without needing the bot to promote them after the
+	// fact. The bot's own PL is set inside matrix.CreateRoom.
+	owners := make(map[id.UserID]bool, len(b.opts.Admins)+1)
+	for _, a := range b.opts.Admins {
+		if uid := id.UserID(a); uid != "" && uid != b.mx.UserID() {
+			owners[uid] = true
+		}
+	}
 	if inviteUser != "" && inviteUser != b.mx.UserID() {
-		invites = []id.UserID{inviteUser}
+		owners[inviteUser] = true
+	}
+	invites := make([]id.UserID, 0, len(owners))
+	powerLevels := make(map[id.UserID]int, len(owners))
+	for u := range owners {
+		invites = append(invites, u)
+		powerLevels[u] = 100
 	}
 
 	for i, r := range defaultProjectRooms {
@@ -543,6 +577,7 @@ func (b *Bridge) handleSpaceJoinedWithInvite(ctx context.Context, parentSpace, n
 			Topic:            r.topic,
 			ParentSpace:      newSpace,
 			Invite:           invites,
+			PowerLevels:      powerLevels,
 			Preset:           "private_chat",
 			StrictParentLink: true,
 		})
@@ -1246,9 +1281,12 @@ func (b *Bridge) handleProjectSlash(ctx context.Context, roomID id.RoomID, sende
 		}
 		if rest == "" {
 			_, _ = b.mx.SendText(ctx, roomID,
-				"用法：`/project new <project-name>`\n\n"+
+				"用法：`/project new <name>` 或 `/project new <path>`\n\n"+
+					"- 给名字（如 `strata-alert`）：只建 Matrix 侧的 Space + 默认 rooms，不绑 cwd。\n"+
+					"- 给路径（如 `/Users/danny0/Code/My/strata-alert` / `~/Code/foo`）：自动 `mkdir -p`，"+
+					"name 取路径末段，cwd 也写好。\n\n"+
 					"机制：bot 直接建一个子 Space（bot 是 creator，PL 100），挂在当前所在的 Org Space 下，"+
-					"自动建默认 rooms（git / deploy / bugs / feature / test）。在 Org Space 自身的 timeline 里发也行。")
+					"自动建默认 rooms（dev / deploy）。在 Org Space 自身的 timeline 里发也行。")
 			return true
 		}
 		return b.handleProjectNew(ctx, roomID, sender, rest)
@@ -1329,7 +1367,38 @@ func (b *Bridge) applyProjectMutation(ctx context.Context, roomID id.RoomID, nam
 // fails the m.space.child link. Falls back to immediate parent if no
 // candidate has sufficient PL — the resulting orphan-from-org Space
 // is still usable, just not visible under the Org tree.
-func (b *Bridge) handleProjectNew(ctx context.Context, roomID id.RoomID, sender id.UserID, name string) bool {
+func (b *Bridge) handleProjectNew(ctx context.Context, roomID id.RoomID, sender id.UserID, arg string) bool {
+	// `arg` may be either a bare project name ("strata-alert") or a
+	// directory path ("/Users/danny0/Code/My/strata-alert", "~/foo",
+	// "./foo"). Path form means: take basename as name, store the
+	// original path as cwd (unexpanded — kept portable), and mkdir
+	// the expanded form so the project is ready to clone/init into.
+	name := arg
+	cwd := ""
+	if looksLikePath(arg) {
+		cwd = arg
+		base := filepath.Base(strings.TrimRight(expandHome(arg), "/"))
+		if base == "" || base == "." || base == "/" {
+			_, _ = b.mx.SendText(ctx, roomID, "❌ 无法从路径推出 project 名：`"+arg+"`")
+			return true
+		}
+		name = base
+		abs := expandHome(cwd)
+		if info, err := os.Stat(abs); err != nil {
+			if !os.IsNotExist(err) {
+				_, _ = b.mx.SendText(ctx, roomID, "❌ 检查路径失败："+err.Error())
+				return true
+			}
+			if err := os.MkdirAll(abs, 0o755); err != nil {
+				_, _ = b.mx.SendText(ctx, roomID, "❌ 创建目录失败："+err.Error())
+				return true
+			}
+		} else if !info.IsDir() {
+			_, _ = b.mx.SendText(ctx, roomID, "❌ 路径已存在但不是目录：`"+abs+"`")
+			return true
+		}
+	}
+
 	parentSpace, topmost, err := b.resolveProjectParent(ctx, roomID)
 	if err != nil {
 		_, _ = b.mx.SendText(ctx, roomID, "❌ 解析父 Space 失败："+err.Error())
@@ -1384,10 +1453,23 @@ func (b *Bridge) handleProjectNew(ctx context.Context, roomID id.RoomID, sender 
 	// returns created=false and the side effects no-op.
 	b.handleSpaceJoinedWithInvite(ctx, parentSpace, newSpace, name, sender)
 
+	// If the user passed a path, persist cwd onto the just-created
+	// project entry. EnsureProject inside the handler only writes name,
+	// so this is the cwd write — best-effort: the Space is already
+	// usable, a cwd mishap doesn't void it.
+	if cwd != "" && b.opts.Manager != nil {
+		if err := b.opts.Manager.SetProject(string(newSpace), "", cwd, ""); err != nil {
+			log.Printf("[agent] /project new persist cwd=%q failed: %v", cwd, err)
+		}
+	}
+
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "✅ 建好 project **%s**\n\n", name)
 	fmt.Fprintf(&sb, "- space: `%s`\n", FoldHomeServer(string(newSpace), b.opts.ServerName))
 	fmt.Fprintf(&sb, "- parent: `%s`\n", FoldHomeServer(string(parentSpace), b.opts.ServerName))
+	if cwd != "" {
+		fmt.Fprintf(&sb, "- cwd: `%s`\n", cwd)
+	}
 	if parentLinkErr != nil {
 		fmt.Fprintf(&sb, "\n⚠️ 但没能挂到父 Space 下（预检通过却写 child 失败，多半是瞬时错误）：%v\n\n"+
 			"新 Space 现在是顶级独立 Space，你在 Element 的 rooms 列表能看到。"+
@@ -1472,7 +1554,7 @@ const projectSlashHelp = `**` + "`/project`" + ` 命令家族**
 
 - ` + "`/project status`" + ` — 显示当前 room 的 Space / project / cwd 解析结果
 - ` + "`/project list`" + ` — 列出所有已配置 project
-- ` + "`/project new <name>`" + ` — bot 自己建子 Space + 默认 rooms（git/deploy/bugs/feature/test，绕过 PL 50 限制）⛔ admin only
+- ` + "`/project new <name|path>`" + ` — bot 自己建子 Space + 默认 rooms（dev/deploy）；传路径会自动 mkdir 并把 cwd 一并绑好 ⛔ admin only
 - ` + "`/project cwd <path>`" + ` — 给当前 room 所属 Space 设工作目录 ⛔ admin only
 - ` + "`/project name <name>`" + ` — 给当前 Space 起个人类可读的名字 ⛔ admin only
 - ` + "`/project help`" + ` — 这条帮助

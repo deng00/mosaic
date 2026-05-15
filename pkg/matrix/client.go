@@ -455,6 +455,14 @@ type CreateRoomOpts struct {
 	Invite      []id.UserID // users to invite
 	Preset      string      // e.g. "private_chat" or "trusted_private_chat" (default: "private_chat")
 
+	// PowerLevels seeds the room's m.room.power_levels.users map at
+	// creation time (sent as power_level_content_override). The bot
+	// itself is auto-included at 100 — callers don't need to add the
+	// creator. Use this to grant invited humans PL 100 so they can
+	// rename the room, change topic, change avatar, etc. without
+	// needing the bot to promote them after the fact.
+	PowerLevels map[id.UserID]int
+
 	// StrictParentLink — when true and ParentSpace is set, a failure to
 	// publish m.space.child in the parent (typically: bot lacks PL 50)
 	// is fatal: CreateRoom leaves the just-created orphan room and
@@ -479,6 +487,14 @@ func (c *Client) CreateRoom(ctx context.Context, opts CreateRoomOpts) (id.RoomID
 		Invite:   opts.Invite,
 		Preset:   preset,
 		IsDirect: false,
+	}
+	if len(opts.PowerLevels) > 0 {
+		users := make(map[id.UserID]int, len(opts.PowerLevels)+1)
+		users[c.mx.UserID] = 100
+		for u, pl := range opts.PowerLevels {
+			users[u] = pl
+		}
+		req.PowerLevelOverride = &event.PowerLevelsEventContent{Users: users}
 	}
 	resp, err := c.mx.CreateRoom(ctx, req)
 	if err != nil {
