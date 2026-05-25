@@ -121,6 +121,13 @@ func (p *process) Close() error {
 	return nil
 }
 
+// StaleSession satisfies runtime.Process. Codex doesn't expose an
+// equivalent "session not found" failure mode through stderr — its
+// thread/resume errors come back as structured events — so we always
+// report false. If codex grows a comparable failure mode later, hook
+// detection here.
+func (p *process) StaleSession() bool { return false }
+
 // loop dispatches one turn at a time. Strictly serial — matches
 // the bridge's per-room serial inbox so two turns in the same room
 // can't race each other into overlapping codex subprocesses.

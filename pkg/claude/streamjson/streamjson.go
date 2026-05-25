@@ -21,6 +21,7 @@ package streamjson
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -29,8 +30,15 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// staleSessionMarker is the substring claude writes to stderr when it
+// fails to find a session id passed via --resume. Detecting it lets
+// the bridge auto-recover (clear the cached sid + retry once) instead
+// of bouncing the failure back to the user as error_during_execution.
+const staleSessionMarker = "No conversation found with session ID"
 
 // Options collect everything Spawn needs to launch claude. Mirrors the
 // flags happy-cli's claudeRemote uses (sdk/query.ts options).
@@ -102,6 +110,41 @@ type Process struct {
 	doneCh chan error // set to cmd.Wait() error after exit
 	doneMu sync.Mutex
 	done   bool
+
+	// staleSession latches to true if claude prints the marker that
+	// signals a --resume sid we passed no longer exists on disk
+	// (typically: cwd switched, .claude/sessions wiped, or the sid
+	// was a phantom from a failed prior spawn). Pointer so the stderr
+	// tee writer set up before Process exists can share the same
+	// flag.
+	staleSession *atomic.Bool
+}
+
+// StaleSession reports whether claude indicated, via stderr, that the
+// --resume session id it was asked to load is missing. Latched: once
+// set within a Process's lifetime it stays true.
+func (p *Process) StaleSession() bool {
+	if p.staleSession == nil {
+		return false
+	}
+	return p.staleSession.Load()
+}
+
+// stderrTee wraps an io.Writer to scan each chunk for staleSessionMarker
+// before forwarding to the downstream writer. Used to detect stale
+// --resume failures without consuming claude's stderr (still wired to
+// os.Stderr so launchd logs / operator-facing diagnostics keep
+// everything).
+type stderrTee struct {
+	flag *atomic.Bool
+	out  io.Writer
+}
+
+func (s *stderrTee) Write(p []byte) (int, error) {
+	if !s.flag.Load() && bytes.Contains(p, []byte(staleSessionMarker)) {
+		s.flag.Store(true)
+	}
+	return s.out.Write(p)
 }
 
 // UserMessage is the schema written to claude's stdin per turn.
@@ -244,7 +287,8 @@ func SpawnRaw(ctx context.Context, binary string, args []string, extraEnv []stri
 	if cwd != "" {
 		cmd.Dir = cwd
 	}
-	cmd.Stderr = os.Stderr
+	staleSession := new(atomic.Bool)
+	cmd.Stderr = &stderrTee{flag: staleSession, out: os.Stderr}
 	if len(extraEnv) > 0 {
 		cmd.Env = append(os.Environ(), extraEnv...)
 	}
@@ -266,11 +310,12 @@ func SpawnRaw(ctx context.Context, binary string, args []string, extraEnv []stri
 	}
 
 	p := &Process{
-		cmd:     cmd,
-		stdin:   stdin,
-		encoder: json.NewEncoder(stdin),
-		events:  make(chan json.RawMessage, 64),
-		doneCh:  make(chan error, 1),
+		cmd:          cmd,
+		stdin:        stdin,
+		encoder:      json.NewEncoder(stdin),
+		events:       make(chan json.RawMessage, 64),
+		doneCh:       make(chan error, 1),
+		staleSession: staleSession,
 	}
 	go p.readStdout(stdout)
 	go p.waitLoop()

@@ -103,6 +103,16 @@ type Process interface {
 
 	// Close terminates the session and releases resources.
 	Close() error
+
+	// StaleSession reports whether the underlying runtime indicated
+	// that the requested --resume session id is no longer valid (for
+	// claude: the "No conversation found with session ID" stderr line
+	// on resume). The bridge reads this on turn completion to decide
+	// whether to clear the cached sid and transparently retry once
+	// with a fresh session, instead of bouncing error_during_execution
+	// back to the user. Drivers without an analogous failure mode
+	// return false.
+	StaleSession() bool
 }
 
 // Driver is the per-runtime factory. Registered via init() side-effect

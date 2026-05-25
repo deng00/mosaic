@@ -151,10 +151,14 @@ func (r *AgentRuntime) Create(req agent.CreateRequest) (agent.AgentInfo, error) 
 		User:       localpart,
 		Password:   pw,
 		DeviceName: displayName,
+		Runtime:    req.Runtime,
 		Model:      req.Model,
-		Claude: ClaudeRuntimeConfig{
-			PermissionMode: "bypassPermissions",
-		},
+	}
+	// Only seed a Claude config block for claude-runtime agents.
+	// Codex ignores ClaudeRuntimeConfig entirely (see config.go:147),
+	// and emitting an empty `claude:` stanza into the yaml is just noise.
+	if req.Runtime == "" || req.Runtime == "claude" {
+		bc.Claude = ClaudeRuntimeConfig{PermissionMode: "bypassPermissions"}
 	}
 
 	dataDir := agentDataDir(r.cfg.DataDir, bc.ID)

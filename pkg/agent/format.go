@@ -211,6 +211,22 @@ func FormatToolUse(name string, input json.RawMessage) string {
 		}
 		return "📐 ExitPlanMode " + truncate(strings.Join(parts, "; "), 200)
 
+	case "ScheduleWakeup":
+		// /loop dynamic-mode self-pacing: model schedules its own next
+		// wakeup. Reason is the human-facing rationale ("watching CI
+		// run"); the actual /loop prompt is internal and not useful
+		// to surface in the timeline.
+		var v struct {
+			DelaySeconds int    `json:"delaySeconds"`
+			Reason       string `json:"reason"`
+		}
+		_ = json.Unmarshal(input, &v)
+		reason := v.Reason
+		if reason == "" {
+			reason = "(no reason)"
+		}
+		return fmt.Sprintf("⏰ ScheduleWakeup %ds %s", v.DelaySeconds, truncate(oneLine(reason), 180))
+
 	case "TaskStop":
 		// Cancels a running background task (Monitor / Bash
 		// run_in_background). Surface the task_id so the user can

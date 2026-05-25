@@ -44,6 +44,7 @@ import (
 	"github.com/deng00/mosaic/pkg/matrix"
 	_ "github.com/deng00/mosaic/pkg/runtime/claude"
 	_ "github.com/deng00/mosaic/pkg/runtime/codex"
+	_ "github.com/deng00/mosaic/pkg/runtime/opencode"
 )
 
 func main() {

@@ -131,6 +131,8 @@ func attachmentsToBlocks(atts []runtime.Attachment) []streamjson.ImageBlock {
 
 func (p *process) Events() <-chan runtime.Event { return p.events }
 
+func (p *process) StaleSession() bool { return p.sj.StaleSession() }
+
 // Close gives the subprocess up to 2s to drain after closing stdin —
 // matches what the bridge used to pass to streamjson.Process.Close
 // directly.

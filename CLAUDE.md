@@ -51,13 +51,15 @@ design point).
 whose target is itself a Space (i.e. a project Space created under an
 existing Org Space), the bridge fires `EnsureProject` (insert-if-absent
 keyed by Space ID, default name = the Space's `m.room.name`) and the
-winning agent creates the default topic-rooms (`dev`, `deploy` — see
-`defaultProjectRooms` in `pkg/agent/agent.go`) as children. Kept to two
-rooms because the previous five-room set saw partial creation in
-practice (only 1–2 rooms appearing), suspected to be Synapse rate
-limits on room creation; two is below the threshold. Multi-agent races are resolved by `EnsureProject` returning
-`created=true` exactly once. Direct invites to a top-level Space don't
-trigger this — only the auto-join-from-parent path.
+winning agent creates a single default topic-room named
+`<project>-main` as a child (see `handleSpaceJoinedWithInvite` in
+`pkg/agent/agent.go`). One room per project matches how users actually
+organise — extra topic rooms get added on demand instead of populating
+empty `dev`/`deploy` shells up front; this also keeps the room-creation
+burst short enough to stay under Synapse's `rc_*` rate limits. Multi-agent
+races are resolved by `EnsureProject` returning `created=true` exactly
+once. Direct invites to a top-level Space don't trigger this — only the
+auto-join-from-parent path.
 
 ## Core data model
 
@@ -197,8 +199,9 @@ URL host — set it explicitly in config.yaml.
 
 ## Memory / context lifecycle
 
-Three layers stack into Claude's `--append-system-prompt` on every fresh
-session:
+Three layers stack into the runtime's system prompt on every fresh
+session (claude: `--append-system-prompt`; codex: inlined into the
+first prompt's `<mosaic_system_prompt>` block):
 
 1. `data/agents/<id>/MEMORY.md` — agent identity (persona)
 2. `data/projects/<spaceID>/PROJECT.md` + `DECISIONS.md` — shared facts
@@ -256,10 +259,17 @@ behave well after any number of `/compact` cycles.
 - **Restricted-room auto-join bug**: Synapse 1.152 rejects auth even when
   the bot is a Space member. Likely a Synapse bug. Workaround: manual
   invite. Worth filing upstream.
-- **Per-agent runtime**: `runtime` is a reserved field in
-  `BotConfig.Claude` / `CreateRequest`; stub for switching CodingAgent
-  (Claude Code → OpenCode → Codex → custom Anthropic SDK runner). Not
-  wired yet.
+- **Per-agent runtime** — wired. `BotConfig.Runtime` ("" / "claude" /
+  "codex") selects which driver under `pkg/runtime/` to spawn. Set in
+  config.yaml or via `/agent new` body (`runtime: codex`). Codex driver
+  spawns one `codex exec` per turn (no long-lived stdin), captures
+  `thread_id` for resume, and inlines MEMORY/PROJECT/SUMMARY into the
+  first prompt because codex has no `--append-system-prompt`. Open
+  point: after `/compact` rewrites SUMMARY.md, a resumed codex thread
+  won't see it — would need to also evict the thread on /compact for
+  the new summary to flow in. OpenCode / custom-SDK drivers are still
+  TODO (just need a new `pkg/runtime/<name>/` package implementing
+  `runtime.Driver`).
 - **ENVIRONMENT VARIABLES**: slock UI has env-var injection per agent.
   Not implemented; `BotConfig.Claude` would need an `env: map[string]string`
   passed to `streamjson.Spawn`'s `extraEnv`.

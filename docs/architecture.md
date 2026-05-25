@@ -57,7 +57,7 @@ agent 只解析房间的**直接父 Space** 作为项目，不向上爬整个链
 
 ### 自动初始化新项目
 
-当 bot 自动加入一个 `m.space.child`，且目标本身也是一个 Space（即"父 Space 下新建的子 Space = 新项目"）时，bridge 会触发 `EnsureProject`（按 Space ID 幂等插入），并由第一个赢得 race 的 agent 在新 Space 里建出默认 rooms：`git` / `deploy` / `bugs` / `feature` / `test`（见 `pkg/agent/agent.go` 的 `defaultProjectRooms`）。直接邀请到顶层 Space 不会触发——只有 auto-join-from-parent 这条路。
+当 bot 自动加入一个 `m.space.child`，且目标本身也是一个 Space（即"父 Space 下新建的子 Space = 新项目"）时，bridge 会触发 `EnsureProject`（按 Space ID 幂等插入），并由第一个赢得 race 的 agent 在新 Space 里建一个默认 room：`<project>-main`（见 `pkg/agent/agent.go` 的 `handleSpaceJoinedWithInvite`）。单 room 而非多 room 的取舍：实际用法下用户会按需开新的 topic room，比预先铺一组空 `dev`/`deploy` 更贴合；同时也避开了 Synapse `rc_*` 速率限制的边界。直接邀请到顶层 Space 不会触发——只有 auto-join-from-parent 这条路。
 
 ## 数据模型
 

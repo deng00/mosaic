@@ -731,6 +731,28 @@ func (c *Client) Typing(ctx context.Context, roomID id.RoomID, on bool, timeoutM
 	return err
 }
 
+// slowSendThreshold is the minimum send/edit duration that earns a
+// log line. Lowered to 100ms while we're chasing a "messages bunch up
+// then flush" symptom — the previous 500ms threshold caught nothing,
+// suggesting either (a) genuine sends are sub-500ms and the stall is
+// happening downstream (Synapse broadcast / sync delivery), or (b)
+// the SDK is buffering before the HTTP call we're measuring. At 100ms
+// we'd also see "moderate" stalls that 500ms hid.
+const slowSendThreshold = 100 * time.Millisecond
+
+// logSlowSend emits one diagnostic line when a Matrix write took
+// >= slowSendThreshold. Used by SendTextMentions / SendEmote /
+// EditTextMentions to surface request-side stalls — handy for the
+// "messages bunch up and then flush" symptom where the bridge looks
+// silent until something unblocks the dispatch loop.
+func logSlowSend(op string, roomID id.RoomID, bodyLen int, start time.Time, err error) {
+	dur := time.Since(start)
+	if dur < slowSendThreshold {
+		return
+	}
+	log.Printf("[matrix] slow %s room=%s body=%dB dur=%v err=%v", op, roomID, bodyLen, dur, err)
+}
+
 // SendText posts a fresh m.room.message (text). When the body looks
 // like markdown (tables, headings, code, lists, …), we also fill the
 // HTML formatted_body so Element renders it richly. Returns the event
@@ -749,7 +771,9 @@ func (c *Client) SendTextMentions(ctx context.Context, roomID id.RoomID, body st
 	if len(mentions) > 0 {
 		content.Mentions = &event.Mentions{UserIDs: mentions}
 	}
+	start := time.Now()
 	resp, err := c.mx.SendMessageEvent(ctx, roomID, event.EventMessage, content)
+	logSlowSend("text", roomID, len(body), start, err)
 	if err != nil {
 		return "", err
 	}
@@ -764,7 +788,9 @@ func (c *Client) SendTextMentions(ctx context.Context, roomID id.RoomID, body st
 func (c *Client) SendEmote(ctx context.Context, roomID id.RoomID, body string) (id.EventID, error) {
 	content := buildTextContent(body)
 	content.MsgType = event.MsgEmote
+	start := time.Now()
 	resp, err := c.mx.SendMessageEvent(ctx, roomID, event.EventMessage, content)
+	logSlowSend("emote", roomID, len(body), start, err)
 	if err != nil {
 		return "", err
 	}
@@ -796,7 +822,9 @@ func (c *Client) EditTextMentions(ctx context.Context, roomID id.RoomID, origEve
 		Type:    event.RelReplace,
 		EventID: origEventID,
 	}
+	start := time.Now()
 	_, err := c.mx.SendMessageEvent(ctx, roomID, event.EventMessage, outer)
+	logSlowSend("edit", roomID, len(body), start, err)
 	return err
 }
 

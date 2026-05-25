@@ -183,7 +183,14 @@ type pendingAsk struct {
 
 func New(mx *matrix.Client, opts Options) *Bridge {
 	if opts.FlushInterval <= 0 {
-		opts.FlushInterval = 200 * time.Millisecond
+		// 1.5s by default. Trade-off: streaming-text Matrix edits batch
+		// into ~7-8× fewer EditText calls per turn than 200ms throttle,
+		// which reduces server-side broadcast pressure (Synapse single-
+		// reactor + federation_sender cache thrash was bunching edits
+		// up and flushing them in bursts). Cost: typing effect goes
+		// from "live keystrokes" to "phrase-by-phrase". Tunable per
+		// deployment if a faster cadence is needed.
+		opts.FlushInterval = 1500 * time.Millisecond
 	}
 	return &Bridge{
 		mx:              mx,
@@ -510,11 +517,11 @@ func (b *Bridge) handleSpaceJoined(ctx context.Context, parentSpace, newSpace id
 //  1. EnsureProject inserts a project entry keyed by the new Space's
 //     ID, defaulting the project name to the Space's m.room.name.
 //     Only the first agent to win the race gets created=true.
-//  2. The winning agent creates the default topic-rooms (see
-//     defaultProjectRooms) as children of the new Space. Other agents
+//  2. The winning agent creates a single default topic-room named
+//     "<project>-main" as a child of the new Space. Other agents
 //     no-op so we don't end up with duplicate rooms.
 //
-// inviteUser is the human who should be pinged into the default rooms
+// inviteUser is the human who should be pinged into the default room
 // directly (the /project new caller). Pass "" for the auto-join path
 // where there's no specific caller.
 //
@@ -562,73 +569,50 @@ func (b *Bridge) handleSpaceJoinedWithInvite(ctx context.Context, parentSpace, n
 		powerLevels[u] = 100
 	}
 
-	for i, r := range defaultProjectRooms {
-		// Space + every room is a separate state-write burst. Synapse's
-		// rc_message / rc_joins / rc_create_room limits will start
-		// dropping requests if we fire them back-to-back — historically
-		// we saw only the first 1–2 default rooms appear before the
-		// rest silently failed. 200ms between rooms keeps us under
-		// every commonly-configured limit.
-		if i > 0 {
-			time.Sleep(200 * time.Millisecond)
+	// Single default room: "<project>-main". Used to be a fixed
+	// dev/deploy pair; one room per project turned out to match how
+	// users actually organise — they create extra topic rooms on
+	// demand instead of populating two empty ones up front.
+	roomName := defaultName + "-main"
+	if _, err := b.mx.CreateRoom(ctx, matrix.CreateRoomOpts{
+		Name:             roomName,
+		Topic:            "主讨论区",
+		ParentSpace:      newSpace,
+		Invite:           invites,
+		PowerLevels:      powerLevels,
+		Preset:           "private_chat",
+		StrictParentLink: true,
+	}); err != nil {
+		log.Printf("[agent] default room %q in space %s failed: %v", roomName, newSpace, err)
+		// Two failure modes hit this branch with very different fixes,
+		// so route the hint by error code:
+		//   - M_LIMIT_EXCEEDED: Synapse rc_* throttling — transient,
+		//     just retry. Usually triggered by neighbouring bursts in
+		//     the same minute (e.g. a /project new shortly after).
+		//   - everything else (typically M_FORBIDDEN): bot lacks PL 50
+		//     in newSpace, can't write m.space.child. Real fix is to
+		//     promote the bot to Moderator. Only happens on the
+		//     auto-join path (bot joining a Space someone else built);
+		//     /project new creates the Space itself so the bot is
+		//     PL 100 there.
+		// The hint posts into the parent Org Space, where the user is watching.
+		var hint string
+		if matrix.IsRateLimited(err) {
+			hint = fmt.Sprintf(
+				"⚠️ 在新 Space **%s** 里建默认 room `%s` 被 Synapse 限流（`M_LIMIT_EXCEEDED`）。\n\n"+
+					"稍等十几秒后重发 `/project new %s`，或在该 Space 里手动 add child room。",
+				defaultName, roomName, defaultName)
+		} else {
+			hint = fmt.Sprintf(
+				"⚠️ 在新 Space **%s** 里建默认 room `%s` 失败：%v\n\n"+
+					"常见原因：我在该 Space 不是 Moderator（需要 PL ≥ 50 才能挂 child room）。"+
+					"在 Element 里把我提为 Moderator，再重新创建一次该 Space 就会自动建好默认 room。",
+				defaultName, roomName, err)
 		}
-		_, err := b.mx.CreateRoom(ctx, matrix.CreateRoomOpts{
-			Name:             r.name,
-			Topic:            r.topic,
-			ParentSpace:      newSpace,
-			Invite:           invites,
-			PowerLevels:      powerLevels,
-			Preset:           "private_chat",
-			StrictParentLink: true,
-		})
-		if err != nil {
-			log.Printf("[agent] default room %q in space %s failed: %v", r.name, newSpace, err)
-			// Two failure modes hit this branch with very different fixes,
-			// so route the hint by error code:
-			//   - M_LIMIT_EXCEEDED: Synapse rc_* throttling — transient,
-			//     just retry. Likely when N rooms are being created
-			//     back-to-back; the 200ms between CreateRoom calls above
-			//     usually keeps us under the limit, but bursts elsewhere
-			//     in the same minute can still trip it.
-			//   - everything else (typically M_FORBIDDEN): bot lacks PL 50
-			//     in newSpace, can't write m.space.child. Real fix is to
-			//     promote the bot to Moderator. Only happens on the
-			//     auto-join path (bot joining a Space someone else built);
-			//     /project new creates the Space itself so the bot is
-			//     PL 100 there.
-			// Bail on the first failure either way — both modes affect
-			// every subsequent room in the loop. The hint posts into the
-			// parent Org Space, where the user is watching.
-			var hint string
-			if matrix.IsRateLimited(err) {
-				hint = fmt.Sprintf(
-					"⚠️ 在新 Space **%s** 里建默认 room `%s` 被 Synapse 限流（`M_LIMIT_EXCEEDED`）。\n\n"+
-						"稍等十几秒后重发 `/project new %s`，或在该 Space 里手动 add child room。",
-					defaultName, r.name, defaultName)
-			} else {
-				hint = fmt.Sprintf(
-					"⚠️ 在新 Space **%s** 里建默认 room `%s` 失败：%v\n\n"+
-						"常见原因：我在该 Space 不是 Moderator（需要 PL ≥ 50 才能挂 child room）。"+
-						"在 Element 里把我提为 Moderator，再重新创建一次该 Space 就会自动建好默认 rooms。",
-					defaultName, r.name, err)
-			}
-			if _, sendErr := b.mx.SendText(ctx, parentSpace, hint); sendErr != nil {
-				log.Printf("[agent] default-room failure hint send to %s failed: %v", parentSpace, sendErr)
-			}
-			return
+		if _, sendErr := b.mx.SendText(ctx, parentSpace, hint); sendErr != nil {
+			log.Printf("[agent] default-room failure hint send to %s failed: %v", parentSpace, sendErr)
 		}
 	}
-}
-
-// defaultProjectRooms is the canonical set of topic rooms created
-// inside a freshly-initialised project Space. Order is the order they
-// appear under the Space in Element.
-var defaultProjectRooms = []struct {
-	name  string
-	topic string
-}{
-	{"dev", "开发讨论：代码 / PR / bug / 功能 / 测试"},
-	{"deploy", "部署 / CI/CD / 发布"},
 }
 
 // roomSession is the per-room state: a long-lived claude process and
@@ -849,6 +833,27 @@ func (b *Bridge) handleSlash(roomID id.RoomID, sender id.UserID, text string) bo
 		default:
 			_, _ = b.mx.SendText(ctx, roomID, inboxFullMsg)
 		}
+		return true
+
+	case "/stop":
+		// Hard-kill the running runtime subprocess (claude / opencode /
+		// codex), keeping the session id in SessionStore so the next
+		// user message resumes the same conversation. Internally this
+		// is the same eviction path used to recover from a dead claude
+		// (proc.Send EOF) — just user-triggered here. Useful when a
+		// runaway turn is burning tokens or stuck in an unproductive
+		// tool loop. Doesn't clear inbox-queued messages — they'll run
+		// on the next spawn.
+		b.mu.Lock()
+		_, alive := b.sessions[roomID]
+		b.mu.Unlock()
+		if !alive {
+			_, _ = b.mx.SendText(ctx, roomID, "ℹ️ 当前没有进行中的会话")
+			return true
+		}
+		b.evictSession(roomID)
+		_, _ = b.mx.SendText(ctx, roomID,
+			"⏹️ 已打断当前 turn。会话历史保留 — 下一条消息会自动 `--resume` 续上。")
 		return true
 	}
 	return false
@@ -1282,11 +1287,11 @@ func (b *Bridge) handleProjectSlash(ctx context.Context, roomID id.RoomID, sende
 		if rest == "" {
 			_, _ = b.mx.SendText(ctx, roomID,
 				"用法：`/project new <name>` 或 `/project new <path>`\n\n"+
-					"- 给名字（如 `strata-alert`）：只建 Matrix 侧的 Space + 默认 rooms，不绑 cwd。\n"+
+					"- 给名字（如 `strata-alert`）：只建 Matrix 侧的 Space + 默认 room，不绑 cwd。\n"+
 					"- 给路径（如 `/Users/danny0/Code/My/strata-alert` / `~/Code/foo`）：自动 `mkdir -p`，"+
 					"name 取路径末段，cwd 也写好。\n\n"+
 					"机制：bot 直接建一个子 Space（bot 是 creator，PL 100），挂在当前所在的 Org Space 下，"+
-					"自动建默认 rooms（dev / deploy）。在 Org Space 自身的 timeline 里发也行。")
+					"自动建一个默认 room（项目名 + `-main`）。在 Org Space 自身的 timeline 里发也行。")
 			return true
 		}
 		return b.handleProjectNew(ctx, roomID, sender, rest)
@@ -1476,7 +1481,7 @@ func (b *Bridge) handleProjectNew(ctx context.Context, roomID id.RoomID, sender 
 			"在父 Space 里手动 add child 即可挂回去；或重试 `/project new`。",
 			parentLinkErr)
 	} else {
-		sb.WriteString("\n下面已自动建好默认 rooms：`dev` / `deploy`。")
+		fmt.Fprintf(&sb, "\n下面已自动建好默认 room：`%s-main`。", name)
 	}
 	// The room-creation burst above (CreateSpace + N×CreateRoom) easily
 	// trips Synapse rc_message/rc_joins limits — without this breather
@@ -1554,7 +1559,7 @@ const projectSlashHelp = `**` + "`/project`" + ` 命令家族**
 
 - ` + "`/project status`" + ` — 显示当前 room 的 Space / project / cwd 解析结果
 - ` + "`/project list`" + ` — 列出所有已配置 project
-- ` + "`/project new <name|path>`" + ` — bot 自己建子 Space + 默认 rooms（dev/deploy）；传路径会自动 mkdir 并把 cwd 一并绑好 ⛔ admin only
+- ` + "`/project new <name|path>`" + ` — bot 自己建子 Space + 默认 room（项目名加 ` + "`-main`" + ` 后缀）；传路径会自动 mkdir 并把 cwd 一并绑好 ⛔ admin only
 - ` + "`/project cwd <path>`" + ` — 给当前 room 所属 Space 设工作目录 ⛔ admin only
 - ` + "`/project name <name>`" + ` — 给当前 Space 起个人类可读的名字 ⛔ admin only
 - ` + "`/project help`" + ` — 这条帮助
@@ -1612,13 +1617,15 @@ const createAgentSyntax = "用法（slock 风格 multi-line）:\n```\n" +
 	"/agent new alice\n" +
 	"name: Alice\n" +
 	"description: Onboarding lead. Helps users get started.\n" +
+	"runtime: claude        # or: codex  (default: claude)\n" +
 	"model: sonnet\n" +
-	"```\n仅 localpart 必填；其余可选，缺省的会写一个通用模板。"
+	"```\n仅 localpart 必填；其余可选，缺省的会写一个通用模板。" +
+	"`runtime: codex` 需要先在主机上 `codex login` 完成 OAuth。"
 
 const agentSlashHelp = `**` + "`/agent`" + ` 命令家族**
 
 - ` + "`/agent list`" + ` — 列出所有已配置 agent + 在线状态
-- ` + "`/agent new <localpart> [display name]`" + ` — 创建新 agent（注册 Matrix 账号 + 写 config + 即时上线 + 创建 ` + "`MEMORY.md`" + ` 模板）⛔ admin only
+- ` + "`/agent new <localpart> [display name]`" + ` — 创建新 agent（注册 Matrix 账号 + 写 config + 即时上线 + 创建 ` + "`MEMORY.md`" + ` 模板）。multi-line body 里加 ` + "`runtime: codex`" + ` 可以建 Codex 跑的 agent（需主机已 ` + "`codex login`" + `）。⛔ admin only
 - ` + "`/agent help`" + ` — 这条帮助
 
 新 agent 的 ` + "`MEMORY.md`" + ` 是其 persona / role：
@@ -1631,7 +1638,7 @@ You are Cindy, the onboarding lead.
 - ...
 ` + "```" + `
 
-每次 fresh claude session 启动时，` + "`MEMORY.md`" + ` 会作为 system prompt 注入。`
+每次 fresh runtime session 启动时，` + "`MEMORY.md`" + ` 会作为 system prompt 注入。Codex runtime 因为没有 ` + "`--append-system-prompt`" + `，会把它内联到首轮 prompt 的 ` + "`<mosaic_system_prompt>`" + ` 块里。`
 
 const sessionSlashHelp = `**` + "`/session`" + ` 命令家族**
 
@@ -1787,6 +1794,7 @@ const slashHelp = `**可用命令**
 
 - ` + "`/session`" + ` — session 管理（new / set …）— 见 ` + "`/session help`" + `
 - ` + "`/compact`" + ` — 让 claude 把当前会话总结成一份 markdown 摘要，归档到本 room 的 ` + "`SUMMARY.md`" + `；之后的新会话会自动注入这份摘要作为系统提示
+- ` + "`/stop`" + ` — 立刻杀掉当前 turn 的运行时子进程；保留 session id，下一条消息会 ` + "`--resume`" + ` 续上原对话
 - ` + "`/archive`" + ` — 把本 room 标记为已归档：bot 不再响应（除 ` + "`/unarchive`" + `），但 memory 文件保留
 - ` + "`/unarchive`" + ` — 唤醒已归档的 room
 - ` + "`/status`" + ` — 显示当前 room 的 session id / project / cwd
@@ -1920,8 +1928,20 @@ func toRuntimeAttachments(in []matrix.Attachment) []runtime.Attachment {
 }
 
 func (b *Bridge) runTurn(roomID id.RoomID, sender id.UserID, text string, attachments []matrix.Attachment) {
+	b.runTurnAttempt(roomID, sender, text, attachments, false)
+}
+
+// runTurnAttempt is the recursive form. `isRetry=true` is set when
+// we're already inside an auto-retry triggered by a stale --resume sid;
+// it prevents a second retry from recursing further and instead lets
+// the error bubble up to the user.
+func (b *Bridge) runTurnAttempt(roomID id.RoomID, sender id.UserID, text string, attachments []matrix.Attachment, isRetry bool) {
 	ctx := context.Background()
-	log.Printf("[agent] runTurn start in %s", roomID)
+	if isRetry {
+		log.Printf("[agent] runTurn retry in %s (fresh session, prior sid was stale)", roomID)
+	} else {
+		log.Printf("[agent] runTurn start in %s", roomID)
+	}
 
 	sess := b.getOrCreate(ctx, roomID)
 	if sess == nil || sess.proc == nil {
@@ -1973,7 +1993,8 @@ func (b *Bridge) runTurn(roomID id.RoomID, sender id.UserID, text string, attach
 	flush := time.NewTicker(b.opts.FlushInterval)
 	defer flush.Stop()
 
-	for {
+	done := false
+	for !done {
 		select {
 		case <-flush.C:
 			// Keep the typing indicator alive even when the agent is
@@ -1989,8 +2010,7 @@ func (b *Bridge) runTurn(roomID id.RoomID, sender id.UserID, text string, attach
 				_, _ = b.mx.SendText(ctx, roomID, "❌ agent 进程退出（已清理本会话状态，下条消息将自动 resume 重启）")
 				return
 			}
-			done := t.consume(ctx, ev)
-			if done {
+			if t.consume(ctx, ev) {
 				t.flushPendingText(ctx, true)
 				log.Printf("[agent] turn %d in %s: done (final-text=%dB, tool_msgs=%d)",
 					turnIdx, roomID, len(t.lastFinalText), t.toolCount)
@@ -2021,9 +2041,26 @@ func (b *Bridge) runTurn(roomID id.RoomID, sender id.UserID, text string, attach
 							fmt.Sprintf("✅ 已归档（%d 字节 → SUMMARY.md）。LLM 上下文已重置；下一条消息会基于摘要开新会话。", len(summary)))
 					}
 				}
-				return
+				done = true
 			}
 		}
+	}
+
+	// Post-loop: if the turn ended in error and claude indicated the
+	// --resume sid was stale (cwd switch leaving a sid behind, or a
+	// phantom sid from a failed initial spawn), recover transparently:
+	// clear the sid, drop the dead session, and retry once with a fresh
+	// claude. Otherwise surface the error to the user.
+	if t.finalTurnErr != nil {
+		if !isRetry && sess.proc.StaleSession() {
+			log.Printf("[agent] turn %d in %s: stale --resume sid detected — clearing + retrying once", turnIdx, roomID)
+			b.endSession(roomID)
+			_, _ = b.mx.SendText(ctx, roomID, "♻️ 上次会话 id 已失效（可能因为 cwd 切换），已重置并用新会话自动重试…")
+			b.runTurnAttempt(roomID, sender, text, attachments, true)
+			return
+		}
+		t.refreshTypingIfStale(ctx)
+		_, _ = b.mx.SendText(ctx, roomID, formatTurnError(*t.finalTurnErr))
 	}
 }
 
@@ -2048,6 +2085,13 @@ type turn struct {
 	// system/init carries the current session_id; we mirror it here
 	// so SessionStore can persist it after the turn ends.
 	lastSessionID string
+
+	// finalTurnErr captures the TurnDone payload when claude reports
+	// the turn ended with an error subtype. Held back from being
+	// surfaced to the user immediately so runTurn can first inspect
+	// proc.StaleSession() and decide whether to retry transparently
+	// (stale --resume sid) or render the error.
+	finalTurnErr *runtime.TurnDone
 
 	typing       bool
 	lastTypingAt time.Time
@@ -2241,8 +2285,10 @@ func (t *turn) consume(ctx context.Context, ev runtime.Event) bool {
 
 	case runtime.TurnDone:
 		if e.Err != "" || e.Reason != "" {
-			t.refreshTypingIfStale(ctx)
-			_, _ = t.b.mx.SendText(ctx, t.roomID, formatTurnError(e))
+			// Stash for runTurn's post-loop decision: it inspects
+			// proc.StaleSession() and may retry instead of surfacing.
+			ec := e
+			t.finalTurnErr = &ec
 		}
 		return true
 	}
@@ -2393,6 +2439,13 @@ func (b *Bridge) dispatchLoop(s *roomSession) {
 			b.pendingCompact[s.roomID] = true
 			b.mu.Unlock()
 		}
+		// Fire typing immediately on dequeue, before runTurn's slow
+		// path (cold spawn, Send blocking on stdin, waiting for the
+		// first agent event). Without this, a slow first reply leaves
+		// the user staring at silence for several seconds. turn-scoped
+		// startTyping inside runTurn keeps the indicator refreshed for
+		// the rest of the turn.
+		_ = b.mx.Typing(context.Background(), s.roomID, true, 30000)
 		b.runTurn(s.roomID, req.sender, req.text, req.attachments)
 		// Note: if /session new or /compact ran during the turn, the
 		// session was removed from b.sessions but THIS goroutine
