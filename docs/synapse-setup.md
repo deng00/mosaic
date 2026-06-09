@@ -104,7 +104,7 @@ docker compose logs -f synapse   # 看跑起来
 ```bash
 docker compose exec synapse register_new_matrix_user \
   -c /data/homeserver.yaml \
-  -u danny -p '你的密码' -a \
+  -u alice -p '你的密码' -a \
   http://localhost:8008
 ```
 
@@ -113,7 +113,7 @@ docker compose exec synapse register_new_matrix_user \
 ## 6. 配 Element 登录
 
 打开 https://app.element.io（或自己跑 element-web）。
-homeserver 手动选 `http://localhost:8008`，登 `@danny:localhost`。
+homeserver 手动选 `http://localhost:8008`，登 `@alice:localhost`。
 
 ## 7. 喂给 Mosaic 的信息 ⭐
 
@@ -125,7 +125,7 @@ server_name: localhost                   # ② 跟 homeserver.yaml 一致
 data_dir: ./data
 
 admins:
-  - "@danny:localhost"                   # ③ 你刚创建的管理员
+  - "@alice:localhost"                   # ③ 你刚创建的管理员
 
 # ④ 从 homeserver.yaml 复制过来 —— /agent new 需要这个来注册新 bot 账号
 registration_shared_secret: "随便一长串_base64_或_uuid_要保密"
@@ -155,8 +155,8 @@ agents:
 ## 8. 起 Mosaic + 测试
 
 ```bash
-make install
-launchctl load ~/Library/LaunchAgents/com.danny0.mosaic.plist
+make install        # 编译并安装到 $GOBIN（一般是 ~/go/bin/mosaic）
+mosaic              # 前台跑；要常驻请套自己平台的进程管理器（launchd / systemd / docker / supervisor）
 tail -f ~/.mosaic/agent.log
 ```
 

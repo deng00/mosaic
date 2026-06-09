@@ -215,7 +215,7 @@ config: server_name: localhost
 - **不要往 `data/projects/<spaceID>/PROJECT.md` 写**——用户管理的。只有 `SUMMARY.md` 是 agent-managed
 - **goolm，不是 libolm**。build 时 `-tags goolm`。libolm 上游已弃，goolm 是 mautrix-go 的纯 Go 移植
 - **config.yaml 写入要原子**：marshal 完整 FileConfig，写 `path.tmp`，rename。用户可能正用编辑器开着它
-- **agent 行为改动的运行顺序**：改代码 → `make build` → `launchctl kickstart -k gui/$(id -u)/com.danny0.mosaic` → tail `~/.mosaic/agent.log` → 在 Element 里戳
+- **agent 行为改动的运行顺序**：改代码 → `make install` → 用你平台上跑 mosaic 的进程管理器重启它 → tail `~/.mosaic/agent.log` → 在 Element 里戳
 
 ## 开放设计点
 

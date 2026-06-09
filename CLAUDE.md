@@ -116,9 +116,10 @@ Reasons:
 - **Hot-add via /agent new** — register Synapse user via shared secret,
   append config, spawn goroutine, all without restart.
 
-Trade-off accepted: a process crash takes all agents down. `KeepAlive=true`
-launchd plist auto-restarts within 10s; conversations resume via
-`--resume <sid>` from `sessions.json`.
+Trade-off accepted: a process crash takes all agents down. Wrap mosaic in
+whatever process manager fits your OS (launchd / systemd / supervisor /
+docker) with restart-on-exit enabled; conversations resume via
+`--resume <sid>` from `sessions.json` after the restart.
 
 ## Per-room serial inbox
 
@@ -242,9 +243,10 @@ behave well after any number of `/compact` cycles.
   it's user-curated. Only `SUMMARY.md` is agent-managed.
 - **goolm, not libolm**. Build with `-tags goolm` (Makefile does this).
   libolm is upstream-deprecated; goolm is mautrix-go's pure-Go port.
-- **The launchd plist points at the binary in the source tree**
-  (`~/Code/test/mosaic/mosaic`) and works dir is `~/.mosaic`. If the
-  source dir moves, update the plist.
+- **`make install` puts the binary at `$GOBIN`** (defaults to
+  `~/go/bin/mosaic`). Whichever process manager you use should point at
+  that path and chdir to `~/.mosaic`. Re-run `make install` after every
+  code change before restarting the daemon.
 
 ## Open design points
 
@@ -289,5 +291,5 @@ behave well after any number of `/compact` cycles.
 - **Do** treat config.yaml writes as atomic: marshal full FileConfig,
   write to `path.tmp`, rename. The user may have it open in an editor.
 - **Run order for changes affecting agent behaviour**: edit code →
-  `make build` → `launchctl kickstart -k gui/$(id -u)/com.danny0.mosaic`
-  → tail `~/.mosaic/agent.log` → poke from Element.
+  `make install` → restart your mosaic process (via whatever process
+  manager you wired up) → tail `~/.mosaic/agent.log` → poke from Element.

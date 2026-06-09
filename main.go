@@ -12,10 +12,10 @@
 //	       user: claude-bot2
 //	       password: bot1234
 //	       claude:
-//	         cwd: /Users/danny0
+//	         cwd: ~/Code
 //	   rooms:
 //	     "!abc:localhost":
-//	       cwd: /Users/danny0/Code/projectA
+//	       cwd: ~/Code/projectA
 //
 //  2. Env vars (legacy; one bot only):
 //

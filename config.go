@@ -24,22 +24,22 @@ import (
 //	    device_name: mosaic
 //	    claude:
 //	      binary: claude
-//	      cwd: /Users/danny0
+//	      cwd: ~/Code
 //	      permission_mode: bypassPermissions
 //	  - id: code-reviewer
 //	    user: code-reviewer
 //	    password: bot1234
 //	    claude:
-//	      cwd: /Users/danny0/Code
+//	      cwd: ~/Code
 //	      append_system_prompt: "You are a code review assistant."
 //	rooms:
 //	  "!projABC:localhost":
-//	    cwd: /Users/danny0/Code/projA
+//	    cwd: ~/Code/projA
 //	    model: claude-sonnet-4-7
 type FileConfig struct {
 	Homeserver string `yaml:"homeserver"`
 	// ServerName is the Matrix server_name baked into every room/user
-	// ID (e.g. "localhost", "matrix.danny.dev"). Distinct from the
+	// ID (e.g. "localhost", "matrix.example.com"). Distinct from the
 	// homeserver URL host: with `http://127.0.0.1:8008` the URL host
 	// is 127.0.0.1 but Synapse may carry `server_name: localhost` in
 	// homeserver.yaml. Used for display folding (hide :server when
@@ -87,7 +87,7 @@ type BotConfig struct {
 	Password string `yaml:"password"`
 	// DeviceName tells *which machine* this agent's runtime subprocess
 	// runs on. Visible in the user's "active sessions" page in Element
-	// (think "Cindy on danny's MacBook" vs "Cindy on the office Mac
+	// (think "Cindy on the MacBook" vs "Cindy on the office Mac
 	// mini"). Defaults to os.Hostname() when empty — useful when the
 	// same agent identity has multiple `mosaic` instances live across
 	// machines.

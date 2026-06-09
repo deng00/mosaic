@@ -42,7 +42,7 @@
 # 1. 起 Synapse + Postgres（参考 docs/synapse-setup.md）
 # 2. 创建你的管理员账号
 docker compose exec synapse register_new_matrix_user \
-  -u danny -p '<pw>' -a -c /data/homeserver.yaml http://localhost:8008
+  -u alice -p '<pw>' -a -c /data/homeserver.yaml http://localhost:8008
 
 # 3. build mosaic
 git clone git@github.com:deng00/mosaic.git
@@ -53,7 +53,7 @@ cat > ~/.mosaic/config.yaml <<'EOF'
 homeserver: http://127.0.0.1:8008
 server_name: localhost
 registration_shared_secret: "<从 homeserver.yaml 拷过来>"
-admins: ["@danny:localhost"]
+admins: ["@alice:localhost"]
 agents:
   - id: cindy
     user: cindy
