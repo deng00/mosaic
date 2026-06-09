@@ -213,28 +213,36 @@ func (p *process) runTurn(msg runtime.Message) {
 	p.emit(runtime.TurnDone{})
 }
 
-// buildArgs assembles the per-turn argv. Branches on fresh vs resume.
+// buildArgs assembles the per-turn argv. Branches on fresh vs resume:
+// the two subcommands accept different flag sets — `exec resume`
+// rejects `--color` and `--model` (the resumed session keeps the
+// model it was created with), and feeding them in causes codex to
+// print its usage line and exit 2. So we only attach `--color` /
+// `--model` to fresh launches.
 func (p *process) buildArgs() []string {
-	common := []string{
-		"--json",
-		"--dangerously-bypass-approvals-and-sandbox",
-		"--color", "never",
-	}
-	if p.opts.Model != "" {
-		common = append(common, "--model", p.opts.Model)
-	}
+	const (
+		flagJSON   = "--json"
+		flagBypass = "--dangerously-bypass-approvals-and-sandbox"
+	)
 	if p.thread == "" {
 		// Fresh launch. --skip-git-repo-check lets codex run in non-git
 		// cwds (e.g. a freshly-cloned workspace before git config is
 		// set up); harmless inside git repos.
-		args := []string{"exec", "--skip-git-repo-check"}
-		args = append(args, common...)
+		args := []string{
+			"exec", "--skip-git-repo-check",
+			flagJSON, flagBypass,
+			"--color", "never",
+		}
+		if p.opts.Model != "" {
+			args = append(args, "--model", p.opts.Model)
+		}
 		return args
 	}
-	// Resume an existing thread. `codex exec resume <id> [PROMPT]`.
-	args := []string{"exec", "resume", p.thread}
-	args = append(args, common...)
-	return args
+	// Resume an existing thread. The accepted shape is:
+	//   codex exec resume [FLAGS] <SESSION_ID> [PROMPT]
+	// FLAGS first, then session id, then (appended by runTurn) the
+	// prompt. Don't pass --color / --model — codex rejects them here.
+	return []string{"exec", "resume", flagJSON, flagBypass, p.thread}
 }
 
 // translate maps one codex JSONL event to zero or more normalized

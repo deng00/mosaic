@@ -24,19 +24,28 @@ func FormatToolUse(name string, input json.RawMessage) string {
 	switch name {
 	case "Bash":
 		// Tool_use blocks default to m.emote (see Bridge.consume), so
-		// Element shows "* <agent> 🛠️ <description>". We surface only
-		// the description here — the actual command is internal
-		// housekeeping and the user doesn't need to read it. Falls
-		// back to "Bash" when the description field is empty (rare;
-		// Claude Code normally fills it in).
+		// Element shows "* <agent> 🛠️ <label>".
+		//
+		// Two input shapes to handle:
+		//   - Claude Code: { "description": "Building mosaic", "command": "..." }
+		//     `description` is the model-generated short label and is
+		//     what we want to show; the command itself is housekeeping.
+		//   - Codex: { "command": "/bin/zsh -lc 'sleep 2'" }
+		//     No description field; fall back to the command, stripped
+		//     of codex's conventional shell-wrapper and outer quotes.
 		var v struct {
 			Description string `json:"description"`
+			Command     string `json:"command"`
 		}
 		_ = json.Unmarshal(input, &v)
-		if v.Description != "" {
-			return "🛠️ " + truncate(oneLine(v.Description), 200)
+		label := v.Description
+		if label == "" {
+			label = stripShellWrapper(v.Command)
 		}
-		return "🛠️ Bash"
+		if label == "" {
+			return "🛠️ Bash"
+		}
+		return "🛠️ " + truncate(oneLine(label), 200)
 
 	case "Read":
 		var v struct {
@@ -294,6 +303,29 @@ func FormatEditBrief(input json.RawMessage) string {
 		marker = " (replace_all)"
 	}
 	return "✏️ Edit `" + relPath(v.FilePath) + "`" + marker
+}
+
+// stripShellWrapper removes the conventional `<shell> -lc` /
+// `<shell> -c` prefix codex prepends to every command_execution
+// (e.g. "/bin/zsh -lc 'sleep 2'") and, if the remainder is a
+// single- or double-quoted shell literal, drops the outer quotes.
+// Returns the original string untouched when neither pattern fits.
+// Used by the Bash renderer so codex's wrapped commands display as
+// the actual user-intended command.
+func stripShellWrapper(s string) string {
+	if s == "" {
+		return ""
+	}
+	for _, p := range []string{"/bin/zsh -lc ", "/bin/bash -lc ", "/bin/sh -lc ", "/bin/sh -c "} {
+		if strings.HasPrefix(s, p) {
+			s = s[len(p):]
+			break
+		}
+	}
+	if n := len(s); n >= 2 && (s[0] == '\'' || s[0] == '"') && s[n-1] == s[0] {
+		s = s[1 : n-1]
+	}
+	return s
 }
 
 // relPath shortens absolute paths under $HOME to ~/foo style and

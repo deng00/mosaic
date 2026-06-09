@@ -1288,7 +1288,7 @@ func (b *Bridge) handleProjectSlash(ctx context.Context, roomID id.RoomID, sende
 			_, _ = b.mx.SendText(ctx, roomID,
 				"用法：`/project new <name>` 或 `/project new <path>`\n\n"+
 					"- 给名字（如 `strata-alert`）：只建 Matrix 侧的 Space + 默认 room，不绑 cwd。\n"+
-					"- 给路径（如 `/Users/danny0/Code/My/strata-alert` / `~/Code/foo`）：自动 `mkdir -p`，"+
+					"- 给路径（如 `~/Code/myproj` / `/srv/work/myproj`）：自动 `mkdir -p`，"+
 					"name 取路径末段，cwd 也写好。\n\n"+
 					"机制：bot 直接建一个子 Space（bot 是 creator，PL 100），挂在当前所在的 Org Space 下，"+
 					"自动建一个默认 room（项目名 + `-main`）。在 Org Space 自身的 timeline 里发也行。")
@@ -1373,9 +1373,9 @@ func (b *Bridge) applyProjectMutation(ctx context.Context, roomID id.RoomID, nam
 // candidate has sufficient PL — the resulting orphan-from-org Space
 // is still usable, just not visible under the Org tree.
 func (b *Bridge) handleProjectNew(ctx context.Context, roomID id.RoomID, sender id.UserID, arg string) bool {
-	// `arg` may be either a bare project name ("strata-alert") or a
-	// directory path ("/Users/danny0/Code/My/strata-alert", "~/foo",
-	// "./foo"). Path form means: take basename as name, store the
+	// `arg` may be either a bare project name ("myproj") or a
+	// directory path ("~/Code/myproj", "/srv/work/myproj", "./myproj").
+	// Path form means: take basename as name, store the
 	// original path as cwd (unexpanded — kept portable), and mkdir
 	// the expanded form so the project is ready to clone/init into.
 	name := arg
@@ -1642,16 +1642,20 @@ You are Cindy, the onboarding lead.
 
 const sessionSlashHelp = `**` + "`/session`" + ` 命令家族**
 
-- ` + "`/session new`" + ` — 直接抛弃当前会话（不留摘要），下一条消息起全新 claude session
-- ` + "`/session set <uuid>`" + ` — 把本 room 绑定到一个已存在的 claude session id（例如从终端 ` + "`claude --resume`" + ` 出来的那条对话），下一条消息会 ` + "`--resume`" + ` 接上。会扫 ` + "`~/.claude/projects/*/<uuid>.jsonl`" + ` 校验 session 记录的 cwd 与 room 配置的 cwd 是否一致，不一致直接拒绝（claude 的 session 文件是按 cwd 切目录存的，不一致 ` + "`--resume`" + ` 会找不到）
-- ` + "`/session show`" + ` — 显示本 room 当前绑定的 session id + cwd + 终端 ` + "`claude --resume`" + ` 复制命令
+- ` + "`/session new`" + ` — 直接抛弃当前会话（不留摘要），下一条消息起全新 runtime session
+- ` + "`/session set <uuid>`" + ` — 把本 room 绑定到一个已存在的 runtime session id；按 agent 的 runtime 类型自动找文件：
+    - claude → ` + "`~/.claude/projects/*/<uuid>.jsonl`" + `（session_id = UUID v4）
+    - codex  → ` + "`~/.codex/sessions/*/*/*/rollout-*-<uuid>.jsonl`" + `（thread_id = UUID v7）
+  会校验 session 文件里的 cwd 与 room 配置的 cwd 是否一致，不一致直接拒绝。
+- ` + "`/session show`" + ` — 显示本 room 当前绑定的 session id + cwd + 终端恢复命令（` + "`claude --resume`" + ` / ` + "`codex resume`" + ` 二选一）
 - ` + "`/session help`" + ` — 这条帮助`
 
-// claudeSessionIDRE matches the UUID format claude code emits for
-// session_id (8-4-4-4-12 lowercase hex). We're strict here because
-// /session set turns into a `claude --resume <id>` invocation, and a
-// malformed id would silently boot a fresh session instead.
-var claudeSessionIDRE = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+// sessionUUIDRe matches the UUID format both claude and codex use for
+// session/thread ids (8-4-4-4-12 hex). Claude session_id is UUID v4;
+// codex thread_id is UUID v7. The byte layout is identical so one
+// regex covers both. We're strict because a malformed id would
+// silently boot a fresh session instead of resuming.
+var sessionUUIDRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 // handleSessionSlash dispatches /session sub-commands. Unknown subs
 // echo a hint; bare /session shows help.
@@ -1696,49 +1700,70 @@ func (b *Bridge) handleSessionShow(ctx context.Context, roomID id.RoomID) {
 		return
 	}
 	r := b.resolve(ctx, roomID)
+	rt := b.currentRuntime()
 	var sb strings.Builder
+	fmt.Fprintf(&sb, "- runtime: `%s`\n", rt)
 	fmt.Fprintf(&sb, "- session id: `%s`\n", sid)
 	if r.Cwd != "" {
 		fmt.Fprintf(&sb, "- cwd: `%s`\n", r.Cwd)
-		fmt.Fprintf(&sb, "- 终端恢复：`cd %s && claude --resume %s`\n", r.Cwd, sid)
-		sb.WriteString("  （先发 `/archive` 或 `/session new` 释放 mosaic 这边的 claude 进程，避免两个进程并发写同一会话文件）")
+		switch rt {
+		case "codex":
+			fmt.Fprintf(&sb, "- 终端恢复：`cd %s && codex resume %s`\n", r.Cwd, sid)
+		default:
+			fmt.Fprintf(&sb, "- 终端恢复：`cd %s && claude --resume %s`\n", r.Cwd, sid)
+		}
+		fmt.Fprintf(&sb, "  （先发 `/archive` 或 `/session new` 释放 mosaic 这边的 %s 进程，避免两个进程并发写同一会话文件）", rt)
 	}
 	_, _ = b.mx.SendText(ctx, roomID, sb.String())
 }
 
-// handleSessionSet binds an existing claude session id (e.g. one
-// running in a terminal `claude --resume`) to this room. The cwd
-// recorded inside the session jsonl must match the room's resolved
-// cwd, otherwise `claude --resume` would silently start a fresh
-// session — refusing up-front is clearer than silent failure.
+// handleSessionSet binds an existing runtime session id (claude
+// session_id from `claude --resume`, or codex thread_id from a prior
+// `codex exec` / `codex resume`) to this room. The cwd recorded inside
+// the session jsonl must match the room's resolved cwd, otherwise
+// resume would silently start a fresh session — refusing up-front is
+// clearer than silent failure.
 func (b *Bridge) handleSessionSet(ctx context.Context, roomID id.RoomID, sid string) {
 	sid = strings.TrimSpace(sid)
 	if sid == "" {
 		_, _ = b.mx.SendText(ctx, roomID, "用法：`/session set <session-uuid>`")
 		return
 	}
-	if !claudeSessionIDRE.MatchString(sid) {
-		_, _ = b.mx.SendText(ctx, roomID, "❌ 不像合法的 claude session id（应为 UUID 格式 8-4-4-4-12）")
+	if !sessionUUIDRe.MatchString(sid) {
+		_, _ = b.mx.SendText(ctx, roomID, "❌ 不像合法的 session id（应为 UUID 格式 8-4-4-4-12）")
 		return
 	}
 	if b.opts.Sessions == nil {
 		_, _ = b.mx.SendText(ctx, roomID, "❌ SessionStore 未初始化，不能持久化 session id")
 		return
 	}
-	jsonlPath, sessionCwd, err := extractClaudeSessionCwd(sid)
+	rt := b.currentRuntime()
+	var (
+		jsonlPath, sessionCwd string
+		err                   error
+	)
+	switch rt {
+	case "claude":
+		jsonlPath, sessionCwd, err = extractClaudeSessionCwd(sid)
+	case "codex":
+		jsonlPath, sessionCwd, err = extractCodexSessionCwd(sid)
+	default:
+		_, _ = b.mx.SendText(ctx, roomID, fmt.Sprintf("❌ runtime=`%s` 不支持 `/session set`（目前支持 claude / codex）", rt))
+		return
+	}
 	if err != nil {
-		_, _ = b.mx.SendText(ctx, roomID, fmt.Sprintf("❌ 找不到本机 claude session：%s\n\n确认 session id 写对了，并且这台机器上 `~/.claude/projects/*/%s.jsonl` 存在。", err.Error(), sid))
+		_, _ = b.mx.SendText(ctx, roomID, fmt.Sprintf("❌ 找不到本机 %s session：%s\n\n确认 session id 写对了，并且这台机器上对应 jsonl 文件存在。", rt, err.Error()))
 		return
 	}
 	r := b.resolve(ctx, roomID)
 	if r.Cwd == "" {
-		_, _ = b.mx.SendText(ctx, roomID, fmt.Sprintf("❌ 本 room 还没配 cwd，无法绑定。\n\nclaude session 记录的 cwd 是 `%s`，先 `/project cwd %s` 给本 room 所属 Space 配上 cwd，再 `/session set %s`。", sessionCwd, sessionCwd, sid))
+		_, _ = b.mx.SendText(ctx, roomID, fmt.Sprintf("❌ 本 room 还没配 cwd，无法绑定。\n\n%s session 记录的 cwd 是 `%s`，先 `/project cwd %s` 给本 room 所属 Space 配上 cwd，再 `/session set %s`。", rt, sessionCwd, sessionCwd, sid))
 		return
 	}
 	roomCwd := filepath.Clean(expandHome(r.Cwd))
 	sessionCwdNorm := filepath.Clean(sessionCwd)
 	if roomCwd != sessionCwdNorm {
-		_, _ = b.mx.SendText(ctx, roomID, fmt.Sprintf("❌ cwd 不一致，拒绝绑定。\n\n- room cwd: `%s`\n- session cwd（来自 `%s`）: `%s`\n\nclaude `--resume` 按 cwd 切目录存 session 文件，不一致会找不到。先 `/project cwd %s` 改 room/project cwd，再 `/session set %s`。", roomCwd, jsonlPath, sessionCwdNorm, sessionCwdNorm, sid))
+		_, _ = b.mx.SendText(ctx, roomID, fmt.Sprintf("❌ cwd 不一致，拒绝绑定。\n\n- room cwd: `%s`\n- session cwd（来自 `%s`）: `%s`\n\nresume 子进程会以 room 配置的 cwd 启动，两边不一致会读不到原会话状态。先 `/project cwd %s` 改 room/project cwd，再 `/session set %s`。", roomCwd, jsonlPath, sessionCwdNorm, sessionCwdNorm, sid))
 		return
 	}
 	b.endSession(roomID)
@@ -1746,7 +1771,17 @@ func (b *Bridge) handleSessionSet(ctx context.Context, roomID id.RoomID, sid str
 		_, _ = b.mx.SendText(ctx, roomID, "❌ 写 sessions.json 失败："+err.Error())
 		return
 	}
-	_, _ = b.mx.SendText(ctx, roomID, fmt.Sprintf("🔗 已绑定终端 claude session `%s`（cwd=`%s`）。下一条消息会 `--resume` 接续上下文。", sid, sessionCwdNorm))
+	_, _ = b.mx.SendText(ctx, roomID, fmt.Sprintf("🔗 已绑定 %s session `%s`（cwd=`%s`）。下一条消息会 resume 接续上下文。", rt, sid, sessionCwdNorm))
+}
+
+// currentRuntime returns the bridge's runtime name with the "" →
+// "claude" default applied. Used at every site that branches on
+// runtime, keeping the default in one place.
+func (b *Bridge) currentRuntime() string {
+	if b.opts.Runtime != "" {
+		return b.opts.Runtime
+	}
+	return "claude"
 }
 
 // extractClaudeSessionCwd locates ~/.claude/projects/*/<sid>.jsonl
@@ -1788,6 +1823,50 @@ func extractClaudeSessionCwd(sid string) (jsonlPath, cwd string, err error) {
 		return jsonlPath, "", err
 	}
 	return jsonlPath, "", fmt.Errorf("no cwd field in first 200 events of %s", jsonlPath)
+}
+
+// extractCodexSessionCwd locates ~/.codex/sessions/<YYYY>/<MM>/<DD>/
+// rollout-*-<sid>.jsonl and returns the cwd recorded in the
+// session_meta event. Codex partitions sessions by date (not by cwd),
+// so we glob across all date subdirs and trust the `payload.cwd`
+// field inside the jsonl.
+func extractCodexSessionCwd(sid string) (jsonlPath, cwd string, err error) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "", "", fmt.Errorf("resolve home dir: %w", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(home, ".codex", "sessions", "*", "*", "*", "rollout-*-"+sid+".jsonl"))
+	if err != nil {
+		return "", "", err
+	}
+	if len(matches) == 0 {
+		return "", "", fmt.Errorf("no session file matching ~/.codex/sessions/*/*/*/rollout-*-%s.jsonl", sid)
+	}
+	jsonlPath = matches[0]
+	f, err := os.Open(jsonlPath)
+	if err != nil {
+		return jsonlPath, "", err
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	// session_meta carries the full base_instructions text — easily
+	// tens of KB; lift the default 64KB cap to match the claude side.
+	scanner.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
+	for i := 0; i < 200 && scanner.Scan(); i++ {
+		var ev struct {
+			Type    string `json:"type"`
+			Payload struct {
+				Cwd string `json:"cwd"`
+			} `json:"payload"`
+		}
+		if json.Unmarshal(scanner.Bytes(), &ev) == nil && ev.Type == "session_meta" && ev.Payload.Cwd != "" {
+			return jsonlPath, ev.Payload.Cwd, nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return jsonlPath, "", err
+	}
+	return jsonlPath, "", fmt.Errorf("no session_meta.cwd in first 200 events of %s", jsonlPath)
 }
 
 const slashHelp = `**可用命令**
